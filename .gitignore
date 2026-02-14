@@ -1,0 +1,29 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Bedrock Execution Artifacts
+.bedrock/*.db
+.bedrock/*.db-journal
+.bedrock/*.db-journal
+/harnesses/
+run.log
+bedrock.toml
+
+# Working Docs
+/docs/
+
+# Environment / Secrets
+.env
+.env.*
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,38 @@
+# Bedrock Example Configuration
+# Copy this to bedrock.toml and customize.
+
+[agent]
+system_prompt = "You are a helpful coding assistant."
+model = "claude-sonnet-4-20250514"  # or "gpt-4o"
+provider = "anthropic"  # or "openai"
+
+# [agent.thinking]
+# enabled = false
+# budget_tokens = 1024  # For extended thinking models
+
+[kernel]
+workspace_root = "."
+max_turns = 50
+heartbeat_interval_secs = 30
+
+[persistence]
+database_path = ".bedrock/state.db"
+
+[harness]
+directory = ".bedrock/harnesses"
+# hot_reload = false  # Future feature
+
+[providers.anthropic]
+type = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+# base_url = "https://api.anthropic.com/v1"  # Override for proxies
+
+[providers.openai]
+type = "openai"
+api_key_env = "OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+
+# You can also define multiple instances of the same provider type
+# [providers.anthropic-backup]
+# type = "anthropic"
+# api_key_env = "ANTHROPIC_BACKUP_KEY"

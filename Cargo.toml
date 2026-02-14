@@ -1,0 +1,64 @@
+[package]
+name = "bedrock"
+version = "0.6.0"
+edition = "2021"
+description = "A single-binary, event-driven LLM execution runtime with composable Lua harness scripts"
+
+[[bin]]
+name = "bedrock"
+path = "src/main.rs"
+
+[lib]
+name = "bedrock"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Config
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async
+tokio = { version = "1.0", features = ["full"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Inference SDK (path dependency during development)
+inference-sdk-core = { path = "../inference-sdk-rust/core" }
+anthropic-sdk = { path = "../inference-sdk-rust/anthropic" }
+openai-sdk = { path = "../inference-sdk-rust/openai" }
+mcp-sdk = { path = "../mcp-sdk-rust", version = "0.2.0" }
+
+# Streaming
+futures = "0.3"
+
+# Async trait support
+async-trait = "0.1"
+
+# Unique IDs
+uuid = { version = "1.0", features = ["v4"] }
+glob = "0.3"
+
+# REPL
+rustyline = "14.0"
+
+
+# Database (Turso — pure Rust SQLite rewrite)
+turso = "0.4"
+
+# Lua harness engine (Luau dialect with sandboxing)
+mlua = { version = "0.11", features = ["luau", "serialize", "async", "macros", "send"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Reduce parallel codegen to improve optimization
+panic = "abort"     # Remove panic unwinding to save space
+strip = true        # Automatically strip symbols from binary
