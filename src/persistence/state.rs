@@ -18,10 +18,11 @@ pub struct StateStore {
 }
 
 /// Schema version — bump when changing table structure.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
-/// SQL statements to initialize the database schema.
-const INIT_SCHEMA: &str = r#"
+
+/// SQL statements to initialize the core database schema.
+const INIT_SCHEMA_CORE: &str = r#"
 -- Core event log (append-only)
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,9 +86,26 @@ CREATE TABLE IF NOT EXISTS memories (
     metadata    TEXT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+"#;
 
--- Vector index (DiskANN) if supported, or just verify column exists.
--- We use F32_BLOB which is compatible with vector functions.
+/// FTS5 specific schema
+const INIT_SCHEMA_FTS: &str = r#"
+-- FTS5 Virtual Table for Keyword Search
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, metadata, content='memories', content_rowid='id');
+
+-- Triggers to keep FTS index in sync with main table
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid, content, metadata) VALUES (new.id, new.content, new.metadata);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content, metadata) VALUES('delete', old.id, old.content, old.metadata);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content, metadata) VALUES('delete', old.id, old.content, old.metadata);
+  INSERT INTO memories_fts(rowid, content, metadata) VALUES (new.id, new.content, new.metadata);
+END;
 "#;
 
 impl StateStore {
@@ -139,11 +157,43 @@ impl StateStore {
 
     /// Initialize the database schema.
     async fn init_schema(&self) -> Result<()> {
-        // execute_batch handles multi-statement SQL natively
+        // 1. Init Core Schema
         self.conn
-            .execute_batch(INIT_SCHEMA)
+            .execute_batch(INIT_SCHEMA_CORE)
             .await
-            .with_context(|| "Failed to initialize database schema")?;
+            .with_context(|| "Failed to initialize database core schema")?;
+
+        // 2. Init FTS Schema (may fail if extension missing)
+        if let Err(e) = self.conn.execute_batch(INIT_SCHEMA_FTS).await {
+            let err_str = e.to_string();
+            if err_str.contains("no such module: fts5") {
+                eprintln!("[WARN] FTS5 extension not available. Hybrid search will be degraded.");
+            } else {
+                 return Err(anyhow::anyhow!("Failed to initialize FTS schema: {}", e));
+            }
+        }
+
+        // Check current version
+        let version: u32 = self.get_schema_version().await?.unwrap_or(0);
+
+        if version < 2 {
+            // Migration v1 -> v2: Add FTS5 and backfill
+            // We reuse the FTS schema string, but also need backfill.
+            // If FTS creation failed above, we should probably skip this or warn.
+            
+            // Re-attempt FTS creation (idempotent due to IF NOT EXISTS) just in case, or skipping if we know it failed?
+            // Actually, execute_batch above likely created it if possible.
+            // We just need to trigger rebuild IF it exists.
+            
+            // Simple check: see if table exists
+            let table_exists = self.conn.query("SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'", ()).await?.next().await?.is_some();
+            
+            if table_exists {
+                 self.conn.execute_batch(r#"
+                    INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
+                "#).await.context("Failed to rebuild FTS index during migration")?;
+            }
+        }
 
         // Record schema version
         self.conn
@@ -154,6 +204,16 @@ impl StateStore {
             .await?;
 
         Ok(())
+    }
+
+    async fn get_schema_version(&self) -> Result<Option<u32>> {
+        let mut rows = self.conn.query("SELECT value FROM schema_info WHERE key = 'version'", ()).await?;
+        if let Some(row) = rows.next().await? {
+            let v_str: String = row.get(0)?;
+            Ok(v_str.parse().ok())
+        } else {
+            Ok(None)
+        }
     }
 
     // ─── Event Log ───────────────────────────────────────────────
@@ -334,7 +394,7 @@ impl StateStore {
         Ok(execs)
     }
 
-    // ─── Memories (Vector Store) ─────────────────────────────────
+    // ─── Memories (Vector + FTS Hybrid Store) ─────────────────────
 
     /// Insert a memory with an embedding vector.
     pub async fn insert_memory(
@@ -367,41 +427,187 @@ impl StateStore {
         Ok(())
     }
 
-    /// Search memories by semantic similarity.
+    /// Search memories using Hybrid Search (Vector + FTS5).
+    /// 
+    /// Uses Reciprocal Rank Fusion (RRF) to combine results.
+    /// - `vector`: Optional embedding for semantic search.
+    /// - `content_query`: Optional keyword string for FTS search. if None, relies only on vector.
     pub async fn search_memories(
         &self,
         session_id: &str,
-        vector: &[f32],
+        vector: Option<&[f32]>,
+        content_query: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemoryRow>> {
-         // Convert target vector to bytes
-        let mut vector_bytes = Vec::with_capacity(vector.len() * 4);
-        for &val in vector {
-            vector_bytes.extend_from_slice(&val.to_le_bytes());
+        use std::collections::HashMap;
+
+        // RRF constant k (usually 60)
+        const RRF_K: f64 = 60.0;
+        let mut scores: HashMap<i64, f64> = HashMap::new();
+        let mut rows_data: HashMap<i64, MemoryRow> = HashMap::new();
+
+        // 1. Vector Search
+        if let Some(vec) = vector {
+            // Convert to bytes
+            let mut vector_bytes = Vec::with_capacity(vec.len() * 4);
+            for &val in vec {
+                vector_bytes.extend_from_slice(&val.to_le_bytes());
+            }
+
+            let mut rows = self.conn.query(
+                "SELECT id, session_id, content, metadata, created_at, vector_distance_cos(embedding, ?1) as distance 
+                 FROM memories 
+                 WHERE session_id = ?2 
+                 ORDER BY distance ASC 
+                 LIMIT ?3",
+                turso::params![vector_bytes, session_id, limit as i64],
+            ).await.context("Failed to search memories (vector)")?;
+
+            let mut rank = 1;
+            while let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                
+                // Track row data if not seen
+                if !rows_data.contains_key(&id) {
+                    rows_data.insert(id, MemoryRow {
+                        id,
+                        session_id: row.get(1)?,
+                        content: row.get(2)?,
+                        metadata: row.get(3)?,
+                        created_at: row.get(4)?,
+                        score: 0.0, // Re-calculated later
+                    });
+                }
+                
+                // RRF score addition
+                let rrf = 1.0 / (RRF_K + rank as f64);
+                *scores.entry(id).or_default() += rrf;
+                rank += 1;
+            }
         }
 
-        let mut rows = self.conn.query(
-            "SELECT id, session_id, content, metadata, created_at, vector_distance_cos(embedding, ?1) as distance 
-             FROM memories 
-             WHERE session_id = ?2 
-             ORDER BY distance ASC 
-             LIMIT ?3",
-            turso::params![vector_bytes, session_id, limit as i64],
-        ).await.context("Failed to search memories (ensure vector extension is loaded?)")?;
-
-        let mut memories = Vec::new();
-        while let Some(row) = rows.next().await? {
-             memories.push(MemoryRow {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                content: row.get(2)?,
-                metadata: row.get(3)?,
-                created_at: row.get(4)?,
-                score: 1.0 - row.get::<f64>(5)?, // Convert distance to similarity
-             });
-        }
+        // 2. FTS Search
+        if let Some(query) = content_query {
+            // Trim and verify query isn't empty
+            let query = query.trim();
+            if !query.is_empty() {
+                 match self.conn.query(
+                    "SELECT rowid, rank FROM memories_fts 
+                     WHERE memories_fts MATCH ?1 
+                     ORDER BY rank 
+                     LIMIT ?2",
+                    turso::params![query, limit as i64],
+                ).await {
+                    Ok(mut rows) => {
+                        let mut rank = 1;
+                        while let Some(row) = rows.next().await? {
+                            let id: i64 = row.get(0)?;
         
-        Ok(memories)
+                            // If we haven't fetched this row's data yet (from vector search), we need to fetch it
+                            if !rows_data.contains_key(&id) {
+                                    // Fetch full row data
+                                let mut full_row_q = self.conn.query(
+                                    "SELECT session_id, content, metadata, created_at FROM memories WHERE id = ?1", 
+                                    [id]
+                                ).await?;
+                                if let Some(full_row) = full_row_q.next().await? {
+                                    rows_data.insert(id, MemoryRow {
+                                        id,
+                                        session_id: full_row.get(0)?,
+                                        content: full_row.get(1)?,
+                                        metadata: full_row.get(2)?,
+                                        created_at: full_row.get(3)?,
+                                        score: 0.0, 
+                                    });
+                                }
+                            }
+
+                            // RRF score addition
+                            // Note: If ID was found in Vector search, it gets a score boost here.
+                            let rrf = 1.0 / (RRF_K + rank as f64);
+                            *scores.entry(id).or_default() += rrf;
+                            rank += 1;
+                        }
+                    },
+                    Err(e) => {
+                        // Check if error is due to missing FTS table
+                        let err_str = e.to_string();
+                        if !err_str.contains("no such table") && !err_str.contains("no such module") {
+                             // If it's a real error (not just missing capability), log or rethrow?
+                             // For resilience, we log and fall through to scenario D if vector also failed/empty
+                             eprintln!("[WARN] FTS search failed: {}", e);
+                        }
+                        // If it is NO_SUCH_TABLE, we just silently skip FTS and fall through
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback: Tokenized LIKE (Scenario D)
+        // Only run if:
+        // a) No vector search was performed (vector is None)
+        // b) FTS search was not performed or yielded no results (actually, specifically if FTS capability is missing)
+        // Simplified trigger: If we have NO results so far, and we have a query, try LIKE fallback.
+        // OR: Strictly if Vector=None AND FTS failed/missing?
+        // User request: "If FTS5 is the limitation... Scenario D is valid."
+        // Let's do: If scores is empty (meaning Vector didn't find anything OR wasn't run) AND (FTS wasn't run OR failed/missing)
+        // Actually, simpler: If scores is empty at this point, and we have a raw query, try to find SOMETHING.
+        
+        if scores.is_empty() {
+             if let Some(query) = content_query {
+                let query = query.trim();
+                // Tokenize by whitespace
+                let terms: Vec<&str> = query.split_whitespace().collect();
+                if !terms.is_empty() {
+                    // "SELECT ... FROM memories WHERE session_id = ? AND (content LIKE ? OR content LIKE ? ...) ORDER BY created_at DESC LIMIT ?"
+                    let mut sql = "SELECT id, session_id, content, metadata, created_at FROM memories WHERE session_id = ?1 AND (".to_string();
+                    let mut params = vec![turso::Value::from(session_id.to_string())];
+                    
+                    for (i, term) in terms.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(" OR ");
+                        }
+                        sql.push_str(&format!("content LIKE ?{}", i + 2));
+                        params.push(turso::Value::from(format!("%{}%", term)));
+                    }
+                    sql.push_str(") ORDER BY id DESC LIMIT ?"); // id DESC ~ created_at DESC
+                    // Last param index is terms.len() + 2
+                    sql.push_str(&(terms.len() + 2).to_string());
+                    params.push(turso::Value::from(limit as i64));
+
+                    let mut rows = self.conn.query(&sql, params).await.context("Failed to execute fallback LIKE search")?;
+                    
+                     while let Some(row) = rows.next().await? {
+                         let id: i64 = row.get(0)?;
+                         // insert directly into results, simpler than score map since this is fallback
+                        rows_data.insert(id, MemoryRow {
+                            id,
+                            session_id: row.get(1)?,
+                            content: row.get(2)?,
+                            metadata: row.get(3)?,
+                            created_at: row.get(4)?,
+                            score: 0.1, // Low score to indicate fallback
+                        });
+                        scores.insert(id, 0.1);
+                     }
+                }
+             }
+        }
+
+        // 3. Sort by final score
+        let mut results: Vec<MemoryRow> = scores.into_iter().filter_map(|(id, score)| {
+            if let Some(mut row) = rows_data.remove(&id) {
+                row.score = score;
+                Some(row)
+            } else {
+                None
+            }
+        }).collect();
+
+        // Sort descending by score
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        
+        Ok(results)
     }
 
     // ─── Harness KV Store ────────────────────────────────────────
@@ -707,5 +913,100 @@ mod tests {
             let val = store.kv_get("key1").await.unwrap();
             assert_eq!(val, Some("value1".to_string()));
         }
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_search() {
+        let store = StateStore::open_memory().await.expect("Failed to open state store");
+
+        // Check if FTS5 table was created (init_schema logs warning but doesn't fail if missing)
+        let fts_available = store.conn
+            .query("SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .is_some();
+
+        if !fts_available {
+            eprintln!("Skipping FTS portions of Hybrid Search test: FTS5 module not available.");
+        }
+
+        let session = "hybrid-test";
+        
+        // Insert memories
+        // 1. "The secret code is 12345" (Vector: [1.0, 0.0])
+        store.insert_memory(
+            session, 
+            "The secret code is 12345", 
+            &[1.0, 0.0], 
+            &json!({})
+        ).await.unwrap();
+
+        // 2. "Apples are red" (Vector: [0.0, 1.0])
+        store.insert_memory(
+            session, 
+            "Apples are red", 
+            &[0.0, 1.0], 
+            &json!({})
+        ).await.unwrap();
+
+        // ... (rest of the test)
+        // Test 1: Vector Search (query closest to [1.0, 0.0])
+        let results = store.search_memories(session, Some(&[1.0, 0.0]), None, 10).await.unwrap();
+        assert_eq!(results.len(), 2); // Should find both, but ranked
+        assert!(results[0].content.contains("secret code"));
+
+        // Test 2: FTS Search (query "12345")
+        if fts_available {
+            let results = store.search_memories(session, None, Some("12345"), 10).await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert!(results[0].content.contains("secret code"));
+        }
+
+        // Test 3: Hybrid Search (Vector [0.0, 1.0] finds Apples, but FTS "12345" finds Secret)
+        let content_query = if fts_available { Some("12345") } else { None };
+        let results = store.search_memories(session, Some(&[0.0, 1.0]), content_query, 10).await.unwrap();
+        
+        if fts_available {
+            // With FTS, "secret code" should be boosted/found via keyword match even if vector is far
+            // Actually, in this test setup:
+            // "secret code" -> [1.0, 0.0]
+            // "Apples" -> [0.0, 1.0]
+            // Query Vector -> [0.0, 1.0] (Matches Apples perfectly)
+            // Query FTS -> "12345" (Matches Secret)
+            
+            // Expected: Both should be returned.
+            assert_eq!(results.len(), 2);
+            let found_secret = results.iter().any(|r| r.content.contains("secret code"));
+            let found_apples = results.iter().any(|r| r.content.contains("Apples"));
+            assert!(found_secret, "Hybrid search missing FTS result");
+            assert!(found_apples, "Hybrid search missing Vector result");
+        } else {
+             // Without FTS, "12345" query is ignored (or warns), so we only get Vector results.
+             // Vector query [0.0, 1.0] matches "Apples" ([0.0, 1.0]) perfectly.
+             // "Secret" ([1.0, 0.0]) has 0 cosine similarity (or distance 1.0).
+             // search_memories returns Top K. It should return Apples.
+             // Secret might be returned if K is high enough, but score is low.
+             // Let's just check Apples is there.
+             let found_apples = results.iter().any(|r| r.content.contains("Apples"));
+             assert!(found_apples);
+        }
+
+        // Test 4: Scenario D - Total Failure Fallback (Tokenized LIKE)
+        // With vector=None and FTS missing (or using standard table), this should hit the LIKE fallback.
+        // Even if FTS exists in this test env, we can test that *some* keyword-based result is returned when vector is None.
+        
+        let results_fallback = store.search_memories(session, None, Some("code"), 10).await.unwrap();
+        assert!(!results_fallback.is_empty(), "Fallback/FTS search failed to find 'code'");
+        assert!(results_fallback[0].content.contains("secret code"));
+
+        // Test 4b: Scenario D - Multi-term Tokenized LIKE
+        // "secret 12345" -> Should match "The secret code is 12345"
+        // This confirms the "OR" logic (if using LIKE fallback) or FTS handling of multiple terms.
+        let results_multi = store.search_memories(session, None, Some("secret 12345"), 10).await.unwrap();
+        assert!(!results_multi.is_empty(), "Fallback/FTS multi-term search failed");
+        assert!(results_multi[0].content.contains("secret code"));
     }
 }

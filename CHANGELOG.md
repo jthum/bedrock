@@ -5,10 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] - 2026-02-15
+
+### Added
+- **Resilient Hybrid Search (FTS5 + Vector)**:
+  - **Reciprocal Rank Fusion (RRF)**: Implemented state-of-the-art result merging for semantic and keyword search.
+  - **Graceful Degradation**: System now handles environments without FTS5 (like standard Turso crate builds) or offline embedding providers without errors.
+  - **Tokenized LIKE Fallback**: Introduced a robust "Safety Net" search (Scenario D) that uses tokenized SQL `LIKE` queries when both vector and FTS engines are unavailable, ensuring keyword retrieval always works.
+
+## [0.8.0] - 2026-02-14
+
+### Added
+- **Harness Module System & Hot-Reload**:
+  - **Atomic Hot-Reload**: Implemented a "fail-safe" swapping mechanism for harness scripts via a directory watcher (Phase 2) and `/reload` command.
+  - **First-Class Module System**: Harness scripts can now `return` tables, enabling clean exported APIs.
+  - **bedrock.import(name)**: New global helper to access exported modules from other scripts.
+  - **Prioritized Hook Discovery**: Unified discovery logic that prioritizes hooks in a script's return table over the global environment.
+  - **Debounced Watcher**: Added an asynchronous file watcher in the `Kernel` to automatically trigger reloads on script changes with 200ms debouncing.
+
 ## [0.7.0] - 2026-02-14
 
 ### Added
-- **Named Providers & Multi-Instance Support (Phase 20)**:
+- **Named Providers & Multi-Instance Support**:
   - Supported arbitrary naming for provider instances in `bedrock.toml` (e.g., `[providers.my-fast-client]`).
   - Introduced `type` field in provider configuration to support multiple instances of the same provider kind.
   - Exposed `ctx.provider` setter in Lua `on_before_inference` hook for dynamic, mid-turn switching.
@@ -17,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.0] - 2026-02-14
 
 ### Changed
-- **Capability Normalizer Architecture (Phase 15)**:
+- **Capability Normalizer Architecture**:
   - Refactored `ProviderClient` to be provider-agnostic by utilizing the `InferenceProvider` trait from the normalized SDK.
   - Standardized streaming event handling: Bedrock now consumes a unified `InferenceEvent` stream regardless of the backend (OpenAI or Anthropic).
   - Decoupled inference and embeddings logic: Embeddings are now handled through a dedicated `EmbeddingProvider` abstraction.
@@ -28,13 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.0] - 2026-02-13
 
 ### Added
-- **Adaptive Thinking (Phase 11)**:
+- **Adaptive Thinking**:
   - Full support for Anthropic's extended reasoning (Claude 3.7 Sonnet / Opus 4.6).
   - Exposure of `thinking_budget` to the Harness Engine for dynamic reasoning depth control.
-- **Cognitive Memory & Anchorage (Phase 12)**:
+- **Cognitive Memory & Anchorage**:
   - Vector search primitives integrated via Turso/SQLite-vec.
   - Automated session summarization and fact anchorage via `on_task_complete` hooks.
-- **Multi-Provider Support (Phase 18) & Mid-Turn Switching (Phase 19)**:
+- **Multi-Provider Support & Mid-Turn Switching**:
   - Enabled coexistence and switching between Anthropic and OpenAI within the same session.
   - Support for `ctx.provider` overrides in `bedrock.agent.spawn` and `on_before_inference`.
 

@@ -12,11 +12,12 @@ The Kernel has no opinions. Your harness has all of them.
 
 - **Physics vs. Harness**: Deterministic governance via embedded Luau (Roblox's sandboxed Lua dialect).
 - **Single-Binary Rust Runtime**: Built for performance, safety, and zero-dependency distribution (~11MB).
-- **Cognitive Memory**: Built-in semantic memory support using `sqlite-vec` in Turso.
+- **Resilient Hybrid Search**: High-performance semantic memory using `sqlite-vec` combined with FTS5 keyword search, re-ranked via Reciprocal Rank Fusion (RRF).
+- **Graceful Degradation**: Automatic "Safety Net" fallback to tokenized SQL `LIKE` scans if vector or FTS subsystems are unavailable.
 - **Subagent Primitive**: Natively spawn nested kernel instances for recursive task delegation.
 - **Model Context Protocol (MCP)**: Dynamic tool discovery and connection to external MCP servers.
 - **Multi-Provider Architecture**: Use and switch between multiple named provider instances (e.g., "primary-claude", "backup-gpt") within the same session or for specific subagents.
-- **Adaptive Thinking**: Full support for Anthropic's extended reasoning (Claude 3.7 Sonnet / Opus 4.6) with dynamic budget control.
+- **Hot-Reload & Module System**: Automatic directory watching for instant script updates and a first-class module system with `bedrock.import`.
 - **Event-Driven Hub**: Every action (tool call, turn, token usage) flows through a programmable governance layer.
 - **Persisted Context**: Atomic event logging and message history in a portable Turso/SQLite database.
 

@@ -3,7 +3,7 @@
 //! These provide all capabilities that harness scripts have access to.
 //! The harness VM itself is sandboxed — these are the only OS-touching APIs.
 
-use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Value};
+use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Value, Table};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -436,6 +436,13 @@ fn register_bedrock_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()
 
     bedrock_table.set("context", context_table)?;
 
+    // bedrock.import(name) -> table | nil
+    bedrock_table.set("import", lua.create_function(|lua, name: String| {
+        let globals = lua.globals();
+        let modules: Table = globals.get("__harness_modules")?;
+        Ok(modules.get::<Value>(name)?)
+    })?)?;
+
     // bedrock.complete(prompt, options) -> string | nil
     {
         let clients = app_data.clients.clone();
@@ -539,24 +546,35 @@ fn register_bedrock_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()
 
                  let result = tokio::task::block_in_place(|| {
                      tokio::runtime::Handle::current().block_on(async {
-                         // 1. Generate embedding for query
-                         if let Some(provider) = &embedding_provider {
-                             let embedding = provider.embed(&query).await
-                                 .map_err(|e| format!("Embedding failed: {}", e))?;
-                             
-                             // 2. Search DB
-                             if let Some(store) = &store {
-                                 let store = store.lock().await;
-                                 let results = store.search_memories("current_session", &embedding.vector, limit).await
-                                     .map_err(|e| format!("DB search failed: {}", e))?;
-                                 Ok(results)
-                             } else {
-                                 Err("No state store available".to_string())
-                             }
-                         } else {
-                             Err("No embedding provider available".to_string())
-                         }
-                     })
+                            // 1. Generate embedding for query (graceful fallback)
+                            let mut vector = None;
+                            if let Some(provider) = &embedding_provider {
+                                match provider.embed(&query).await {
+                                    Ok(embedding) => {
+                                        vector = Some(embedding.vector);
+                                    },
+                                    Err(e) => {
+                                        // Log warning but continue with text-only search
+                                        eprintln!("[WARN] Embedding failed for memory search: {}. Falling back to text-only.", e);
+                                    }
+                                }
+                            } else {
+                                // optional: warn if no provider configured?
+                                // for now, just silently proceed to text search
+                            }
+
+                            // 2. Search DB
+                            if let Some(store) = &store {
+                                let store = store.lock().await;
+                                // Pass vector (if successfully generated) and query (for FTS or fallback)
+                                // We always pass Some(query) now, to allow FTS/LIKE fallback
+                                let results = store.search_memories("current_session", vector.as_deref(), Some(&query), limit).await
+                                    .map_err(|e| format!("DB search failed: {}", e))?;
+                                Ok(results)
+                            } else {
+                                Err("No state store available".to_string())
+                            }
+                        })
                  });
 
                  match result {
@@ -634,7 +652,7 @@ fn register_agent_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()> 
                     }
                     
                     // Init harness for sub-kernel
-                    if let Err(e) = kernel.init_harness() {
+                    if let Err(e) = kernel.init_harness().await {
                         return Err(format!("Sub-kernel harness init failed: {}", e));
                     }
                     
@@ -692,7 +710,7 @@ mod tests {
             fs_root: dir.to_path_buf(),
             workspace_root: dir.to_path_buf(),
             state_store: None,
-            client: None,
+            clients: HashMap::new(),
             embedding_provider: None,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             config: Arc::new(crate::kernel::config::BedrockConfig {
@@ -795,7 +813,7 @@ mod tests {
             fs_root: PathBuf::from("."),
             workspace_root: PathBuf::from("."),
             state_store: None,
-            client: None,
+            clients: HashMap::new(),
             embedding_provider: None,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             config: Arc::new(crate::kernel::config::BedrockConfig {
@@ -832,7 +850,7 @@ mod tests {
             fs_root: PathBuf::from("."),
             workspace_root: PathBuf::from("."),
             state_store: None,
-            client: None,
+            clients: HashMap::new(),
             embedding_provider: None,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             config: Arc::new(crate::kernel::config::BedrockConfig {
@@ -862,7 +880,7 @@ mod tests {
             fs_root: PathBuf::from("."),
             workspace_root: PathBuf::from("."),
             state_store: None,
-            client: None,
+            clients: HashMap::new(),
             embedding_provider: None,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             config: Arc::new(crate::kernel::config::BedrockConfig {

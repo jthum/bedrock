@@ -106,15 +106,19 @@ impl HarnessEngine {
         meta.set("__index", globals)?;
         let _ = env.set_metatable(Some(meta));
 
-        // Load and execute string in the sandboxed environment
-        self.lua.load(source)
+        // Load and execute string in the sandboxed environment, capturing return value
+        let retval: Value = self.lua.load(source)
             .set_name(format!("@{}", path.display()))
             .set_environment(env.clone())
-            .exec()
+            .eval()
             .map_err(|e| anyhow::anyhow!("Failed to load harness script '{}': {}", path.display(), e))?;
 
-        // Extract known hooks from the local environment into the module table
-        let module_exports = self.lua.create_table()?;
+        // Extract known hooks: priority to return value (module table), fallback to env (globals)
+        let module_exports = match retval {
+            Value::Table(t) => t,
+            _ => self.lua.create_table()?,
+        };
+
         let known_hooks = [
             "on_tool_call",
             "on_token_usage",
@@ -125,9 +129,12 @@ impl HarnessEngine {
         ];
 
         for hook in known_hooks {
-            // Check if function exists in the script's env
-            if let Ok(func) = env.get::<Function>(hook) {
-                module_exports.set(hook, func)?;
+            // If hook is already in exports (from return table), keep it.
+            // Otherwise, check if it exists in the script's global env.
+            if !module_exports.contains_key(hook)? {
+                if let Ok(func) = env.get::<Function>(hook) {
+                    module_exports.set(hook, func)?;
+                }
             }
         }
 
@@ -315,7 +322,9 @@ mod tests {
             workspace_root: PathBuf::from("."),
             state_store: None,
             clients: std::collections::HashMap::new(),
+            embedding_provider: None,
             queue: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
+            config: std::sync::Arc::new(crate::kernel::config::BedrockConfig::default()),
         }
     }
 

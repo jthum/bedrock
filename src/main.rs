@@ -123,7 +123,8 @@ async fn main() -> Result<()> {
             let mut kernel = Kernel::new(config, verbose, json);
             kernel.init_state().await?;
             kernel.init_clients()?;
-            kernel.init_harness()?;
+            kernel.init_harness().await?;
+            kernel.start_watcher()?;
             kernel.run(Some(prompt)).await?;
 
             Ok(())
@@ -158,15 +159,16 @@ async fn main() -> Result<()> {
             let mut kernel = Kernel::new(config, verbose, false); // JSON not supported in REPL yet
             kernel.init_state().await?;
             kernel.init_clients()?;
-            kernel.init_harness()?;
+            kernel.init_harness().await?;
+            kernel.start_watcher()?;
             
             // Start REPL loop
             let mut rl = DefaultEditor::new()?;
             if verbose {
                 eprintln!("[bedrock] REPL started. Type 'exit' or Ctrl+D to quit.");
             } else {
-                 println!("Bedrock REPL v0.2.0");
-                 println!("Type 'exit' or Ctrl+D to quit.");
+                 println!("Bedrock REPL v0.6.0");
+                 println!("Type 'exit' or Ctrl+D to quit. Type '/reload' to reload harness.");
             }
 
             // Trigger AgentStart
@@ -180,6 +182,14 @@ async fn main() -> Result<()> {
                         if line.is_empty() { continue; }
                         if line.eq_ignore_ascii_case("exit") { break; }
                         
+                        if line.eq_ignore_ascii_case("/reload") {
+                            eprintln!("[bedrock] Reloading harness...");
+                            match kernel.reload_harness().await {
+                                Ok(_) => eprintln!("[bedrock] Harness reloaded successfully."),
+                                Err(e) => eprintln!("[bedrock] Failed to reload harness: {}", e),
+                            }
+                            continue;
+                        }
                         let _ = rl.add_history_entry(line);
                         
                         // Push prompt to kernel queue and run until empty
@@ -219,7 +229,7 @@ async fn main() -> Result<()> {
             let mut kernel = Kernel::new(config, true, false);
             kernel.init_state().await?;
             kernel.init_clients()?;
-            kernel.init_harness()?;
+            kernel.init_harness().await?;
 
             // Read script
             let script_content = std::fs::read_to_string(&path)

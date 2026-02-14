@@ -1,6 +1,6 @@
 [package]
 name = "bedrock"
-version = "0.6.0"
+version = "0.8.5"
 edition = "2021"
 description = "A single-binary, event-driven LLM execution runtime with composable Lua harness scripts"
 
@@ -43,6 +43,7 @@ async-trait = "0.1"
 # Unique IDs
 uuid = { version = "1.0", features = ["v4"] }
 glob = "0.3"
+notify = "6.1"
 
 # REPL
 rustyline = "14.0"

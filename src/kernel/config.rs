@@ -205,6 +205,30 @@ impl BedrockConfig {
     }
 }
 
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            system_prompt: default_system_prompt(),
+            model: "test-model".to_string(),
+            provider: "mock".to_string(),
+            thinking: None,
+        }
+    }
+}
+
+impl Default for BedrockConfig {
+    fn default() -> Self {
+        Self {
+            agent: AgentConfig::default(),
+            kernel: KernelConfig::default(),
+            persistence: PersistenceConfig::default(),
+            harness: HarnessConfig::default(),
+            providers: ProvidersConfig::default(),
+            embeddings: None,
+        }
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]

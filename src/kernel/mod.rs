@@ -27,6 +27,7 @@ use crate::tools::mcp::McpToolProxy;
 use mcp_sdk::client::McpClient;
 use mcp_sdk::transport::StdioTransport;
 use crate::inference::embeddings::EmbeddingProvider;
+use notify::{RecommendedWatcher, Event};
 
 /// The Bedrock Kernel — manages the agent loop, event system, and tool execution.
 ///
@@ -39,7 +40,10 @@ pub struct Kernel {
     pub json: bool,
     pub tool_registry: ToolRegistry,
     pub state: Option<StateStore>,
-    pub harness: Option<HarnessEngine>,
+    /// Thread-safe harness engine for hot-reloading
+    pub harness: Arc<Mutex<Option<HarnessEngine>>>,
+    /// Watcher handle to keep it alive
+    pub check_watcher: Option<RecommendedWatcher>,
     pub clients: HashMap<String, ProviderClient>,
     pub embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     // Persistent session state
@@ -72,7 +76,8 @@ impl Kernel {
             json,
             tool_registry,
             state: None,
-            harness: None,
+            harness: Arc::new(Mutex::new(None)),
+            check_watcher: None,
             clients: HashMap::new(),
             embedding_provider: None,
             queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -85,7 +90,6 @@ impl Kernel {
         }
     }
 
-    /// Initialize all configured provider clients. Call before `init_harness()` and `run()`.
     /// Initialize all configured provider clients. Call before `init_harness()` and `run()`.
     pub fn init_clients(&mut self) -> Result<()> {
         for (name, config) in &self.config.providers {
@@ -157,7 +161,7 @@ impl Kernel {
     }
 
     /// Initialize the harness engine. Call after `init_state()` and before `run()`.
-    pub fn init_harness(&mut self) -> Result<()> {
+    pub async fn init_harness(&mut self) -> Result<()> {
         let harness_dir = PathBuf::from(&self.config.harness.directory);
 
         // Resolve fs_root: "." means workspace root, otherwise use as-is
@@ -202,13 +206,154 @@ impl Kernel {
             }
         }
 
-        self.harness = Some(engine);
+        {
+            let mut h = self.harness.lock().await;
+            *h = Some(engine);
+        }
+        Ok(())
+    }
+
+    /// Reload the harness from disk (atomic swap).
+    pub async fn reload_harness(&self) -> Result<()> {
+        Self::reload_harness_static(
+            self.harness.clone(),
+            self.config.clone(),
+            self.clients.clone(),
+            self.state.clone(),
+            self.embedding_provider.clone(),
+            self.queue.clone(),
+            self.verbose,
+        ).await
+    }
+
+    /// Static version of reload_harness that can be called from background tasks.
+    pub async fn reload_harness_static(
+        harness_lock: Arc<Mutex<Option<HarnessEngine>>>,
+        config: BedrockConfig,
+        clients: HashMap<String, ProviderClient>,
+        state: Option<StateStore>,
+        embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+        queue: Arc<Mutex<VecDeque<String>>>,
+        verbose: bool
+    ) -> Result<()> {
+        let harness_dir = PathBuf::from(&config.harness.directory);
+        
+        let fs_root = if config.harness.fs_root == "." {
+            PathBuf::from(&config.kernel.workspace_root)
+        } else {
+            PathBuf::from(&config.harness.fs_root)
+        };
+
+        let app_data = HarnessAppData {
+            fs_root,
+            workspace_root: PathBuf::from(&config.kernel.workspace_root),
+            state_store: state.as_ref().map(|s| {
+                Arc::new(Mutex::new(s.clone()))
+            }),
+            clients: clients.clone(),
+            embedding_provider: embedding_provider.clone(),
+            queue: queue.clone(),
+            config: Arc::new(config.clone()),
+        };
+
+        match HarnessEngine::new(app_data) {
+            Ok(mut engine) => {
+                 match engine.load_dir(&harness_dir) {
+                     Ok(_) => {
+                         let script_count = engine.loaded_scripts().len();
+                         let mut h = harness_lock.lock().await;
+                         *h = Some(engine);
+                         if verbose {
+                             eprintln!("[bedrock] Harness reloaded: {} scripts", script_count);
+                         }
+                         Ok(())
+                     },
+                     Err(e) => {
+                         eprintln!("[bedrock] Failed to load harness scripts: {}", e);
+                         Err(e)
+                     }
+                 }
+            },
+            Err(e) => {
+                eprintln!("[bedrock] Failed to create harness engine: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Start watching the harness directory for changes (background thread).
+    pub fn start_watcher(&mut self) -> Result<()> {
+        use notify::{RecursiveMode, Watcher};
+        use std::time::Duration;
+
+        let harness_lock = self.harness.clone();
+        let config = self.config.clone();
+        let clients = self.clients.clone();
+        let state = self.state.clone();
+        let embedding_provider = self.embedding_provider.clone();
+        let queue = self.queue.clone();
+        let verbose = self.verbose;
+        let harness_dir = PathBuf::from(&config.harness.directory);
+
+        if !harness_dir.exists() {
+            if verbose {
+                eprintln!("[bedrock] Harness directory does not exist, skipping watcher: {}", harness_dir.display());
+            }
+            return Ok(());
+        }
+
+        // We use an async channel to debounce events
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(10);
+
+        // Spawn background task to handle reloads with debouncing
+        tokio::spawn(async move {
+            while let Some(_) = rx.recv().await {
+                // Debounce: Wait for more events
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                // Clear any pending events that arrived during sleep
+                while let Ok(_) = rx.try_recv() {}
+
+                if verbose {
+                    eprintln!("[bedrock] Hot-reload triggered by file change...");
+                }
+
+                let _ = Self::reload_harness_static(
+                    harness_lock.clone(),
+                    config.clone(),
+                    clients.clone(),
+                    state.clone(),
+                    embedding_provider.clone(),
+                    queue.clone(),
+                    verbose,
+                ).await;
+            }
+        });
+
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            match res {
+                Ok(event) => {
+                    if event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove() {
+                        let _ = tx.blocking_send(());
+                    }
+                }
+                Err(e) => eprintln!("[bedrock] Watcher error: {:?}", e),
+            }
+        })?;
+
+        watcher.watch(&harness_dir, RecursiveMode::NonRecursive)?;
+        self.check_watcher = Some(watcher);
+
+        if verbose {
+            eprintln!("[bedrock] Watching harness directory: {}", harness_dir.display());
+        }
+
         Ok(())
     }
 
     /// Run a Lua script directly in the harness (for testing/verification).
-    pub async fn run_script(&mut self, script: &str) -> Result<()> {
-        if let Some(ref mut engine) = self.harness {
+    pub async fn run_script(&self, script: &str) -> Result<()> {
+        let mut harness_lock = self.harness.lock().await;
+        if let Some(ref mut engine) = *harness_lock {
              engine.load_script_str(script)?;
         } else {
             anyhow::bail!("Harness not initialized");
@@ -231,23 +376,26 @@ impl Kernel {
          
          // ─── Harness Hook: on_agent_start ────────────────────────────
          // Run only at the beginning of the session
-         if self.turn_index == 0 {
-             self.persist_event(&self.session_id.clone(), &KernelEvent::AgentStart {
-                session_id: self.session_id.clone(),
-             }).await;
-
-             if let Some(ref harness) = self.harness {
-                use crate::harness::verdict::Verdict;
-                let verdict = harness.evaluate(
-                    "on_agent_start",
-                    serde_json::json!({ "session_id": self.session_id }),
-                )?;
-                if let Verdict::Reject(reason) = verdict {
-                    eprintln!("[bedrock] Session rejected by harness: {}", reason);
-                    return Ok(());
-                }
+             if self.turn_index == 0 {
+                 self.persist_event(&self.session_id.clone(), &KernelEvent::AgentStart {
+                    session_id: self.session_id.clone(),
+                 }).await;
+    
+                 {
+                    let harness = self.harness.lock().await;
+                    if let Some(ref engine) = *harness {
+                        use crate::harness::verdict::Verdict;
+                        let verdict = engine.evaluate(
+                            "on_agent_start",
+                            serde_json::json!({ "session_id": self.session_id }),
+                        )?;
+                        if let Verdict::Reject(reason) = verdict {
+                            eprintln!("[bedrock] Session rejected by harness: {}", reason);
+                            return Ok(());
+                        }
+                    }
+                 }
              }
-         }
 
          loop {
              // Pop next task
@@ -262,17 +410,25 @@ impl Kernel {
                  }
                  self.run_task(&prompt).await?;
              } else {
-                 // ─── Harness Hook: on_task_complete ─────────────────────
-                 // Triggered when the queue is explicitly empty.
-                 // This gives the validator a chance to inspect the state and re-queue tasks.
-                 let mut recheck = false;
-                 if let Some(ref harness) = self.harness {
-                      let payload = serde_json::json!({
-                          "session_id": self.session_id,
-                          "turn_count": self.turn_index,
-                      });
-                      
-                      match harness.evaluate("on_task_complete", payload) {
+                  // ─── Harness Hook: on_task_complete ─────────────────────
+                  // Triggered when the queue is explicitly empty.
+                  let mut recheck = false;
+                  
+                  let verdict_result = {
+                      let harness = self.harness.lock().await;
+                      if let Some(ref engine) = *harness {
+                          let payload = serde_json::json!({
+                              "session_id": self.session_id,
+                              "turn_count": self.turn_index,
+                          });
+                          Some(engine.evaluate("on_task_complete", payload))
+                      } else {
+                          None
+                      }
+                  };
+
+                  if let Some(result) = verdict_result {
+                      match result {
                            Ok(Verdict::Modify(new_tasks_val)) => {
                                  if let Some(new_tasks) = new_tasks_val.as_array() {
                                       if !new_tasks.is_empty() {
@@ -373,11 +529,18 @@ impl Kernel {
             self.persist_event(&session_id, &KernelEvent::TurnStart { turn_index: self.turn_index }).await;
 
             // ─── Harness Hook: on_before_inference ───────────────────────
+            let _thinking_budget = self.config.agent.thinking.as_ref()
+                .and_then(|t| if t.enabled { t.budget_tokens } else { None })
+                .unwrap_or(0);
+
             let mut thinking_budget = self.config.agent.thinking.as_ref()
                 .and_then(|t| if t.enabled { t.budget_tokens } else { None })
                 .unwrap_or(0);
 
-            if let Some(ref engine) = self.harness {
+            // Scope for harness lock
+            {
+                let harness = self.harness.lock().await;
+                if let Some(ref engine) = *harness {
                 // Use stored history + system prompt
                 // Note: we might want to let harness see full history
                 let ctx = ContextWrapper::new(
@@ -410,6 +573,7 @@ impl Kernel {
                 provider_name = state.provider;
                 thinking_budget = state.thinking_budget;
             }
+            } // End harness lock
 
             // Resolve client for this turn based on `provider_name` (potentially modified by harness)
             
@@ -533,7 +697,7 @@ impl Kernel {
             let mut tool_results: Vec<InferenceContent> = Vec::new();
             for tc in &pending_tool_calls {
                 if self.verbose { eprintln!("[bedrock] Executing tool: {} ({})", tc.name, tc.id); }
-                let verdict = self.evaluate_tool_call(&tc.name, &tc.id, &tc.args);
+                let verdict = self.evaluate_tool_call(&tc.name, &tc.id, &tc.args).await;
                 let verdict_str = verdict.to_string();
                 let mut final_args = tc.args.clone();
 
@@ -588,8 +752,15 @@ impl Kernel {
                 if !is_error {
                     if let Some(action) = metadata.get("action").and_then(|v| v.as_str()) {
                         if action == "submit_task" {
-                            if let Some(harness) = &self.harness {
-                                match harness.evaluate("on_task_submit", metadata.clone()) {
+                            let verdict_result = {
+                                let harness = self.harness.lock().await;
+                                if let Some(engine) = &*harness {
+                                    Some(engine.evaluate("on_task_submit", metadata.clone()))
+                                } else { None }
+                            };
+                            
+                            if let Some(result) = verdict_result {
+                                match result {
                                     Ok(Verdict::Allow) => {
                                         // Proceed with queuing
                                         if let Some(subtasks) = metadata.get("subtasks").and_then(|v| v.as_array()) {
@@ -673,11 +844,6 @@ impl Kernel {
                                      
                                      // However, `tools` is `Vec<ToolDefinition>`. We need to re-fetch.
                                      // But `tools` variable is defined outside the loop.
-                                     // We can't easily mutate it here without deeper refactoring or just accepting it takes effect next TASK?
-                                     // No, user wants to use tool immediately.
-                                     // Solution: We should move `let tools = ...` INSIDE the loop.
-                                     // Or update it here.
-                                     // But `tools` is used in `client.stream`.
                                      // We can't update `tools` easily because of scope. 
                                      // Ideally, `run_task` loop gets fresh tools each turn.
                                  },
@@ -716,14 +882,15 @@ impl Kernel {
                  let _ = store.insert_message(&session_id, self.turn_index, "tool_result", &serde_json::Value::Array(result_content), None).await;
              }
 
-             self.evaluate_token_usage(self.total_input_tokens, self.total_output_tokens);
+
+
+             self.evaluate_token_usage(self.total_input_tokens, self.total_output_tokens).await;
              self.turn_index += 1;
              task_turn_count += 1;
         }
         Ok(())
     }
 
-    /// Create the appropriate provider client from config.
     /// Create the appropriate provider client from config.
     fn create_client(&self, _name: &str, config: &crate::kernel::config::ProviderConfig) -> Result<ProviderClient> {
         match config.kind.as_str() {
@@ -756,8 +923,10 @@ impl Kernel {
     /// Evaluate harness `on_tool_call` hook.
     ///
     /// Returns the composed verdict. If no harness is loaded, returns `Allow`.
-    fn evaluate_tool_call(&self, name: &str, id: &str, args: &serde_json::Value) -> Verdict {
-        if let Some(ref engine) = self.harness {
+
+    async fn evaluate_tool_call(&self, name: &str, id: &str, args: &serde_json::Value) -> Verdict {
+        let harness = self.harness.lock().await;
+        if let Some(ref engine) = *harness {
             let payload = serde_json::json!({
                 "name": name,
                 "id": id,
@@ -787,8 +956,10 @@ impl Kernel {
     /// Budget enforcement via token hooks is informational in v0.1 — a REJECT here
     /// logs but doesn't halt the loop (the harness can use `db.kv_set` to track state
     /// and reject tool calls instead).
-    fn evaluate_token_usage(&self, input_tokens: u32, output_tokens: u32) {
-        if let Some(ref engine) = self.harness {
+
+    async fn evaluate_token_usage(&self, input_tokens: u32, output_tokens: u32) {
+        let harness = self.harness.lock().await;
+        if let Some(ref engine) = *harness {
             let payload = serde_json::json!({
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
