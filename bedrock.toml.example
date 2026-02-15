@@ -32,6 +32,10 @@ type = "openai"
 api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
 
+[providers.mock]
+type = "mock"
+# base_url = "Optional custom mock response"
+
 # You can also define multiple instances of the same provider type
 # [providers.anthropic-backup]
 # type = "anthropic"
