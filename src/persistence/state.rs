@@ -11,10 +11,15 @@ use anyhow::{Context, Result};
 use turso::{Connection, Database};
 
 /// The state store manages all Bedrock persistence.
+use std::sync::Arc;
+
+/// The state store manages all Bedrock persistence.
+///
+/// It holds a reference to the database engine and spawns connections on demand.
+/// This allows it to be efficiently Cloned and shared across threads.
 #[derive(Clone)]
 pub struct StateStore {
-    db: Database,
-    conn: Connection,
+    db: Arc<Database>,
 }
 
 /// Schema version — bump when changing table structure.
@@ -128,11 +133,7 @@ impl StateStore {
             .await
             .with_context(|| format!("Failed to open database: {}", db_path))?;
 
-        let conn = db
-            .connect()
-            .with_context(|| "Failed to connect to database")?;
-
-        let store = Self { db, conn };
+        let store = Self { db: Arc::new(db) };
         store.init_schema().await?;
 
         Ok(store)
@@ -145,11 +146,7 @@ impl StateStore {
             .await
             .with_context(|| "Failed to open in-memory database")?;
 
-        let conn = db
-            .connect()
-            .with_context(|| "Failed to connect to in-memory database")?;
-
-        let store = Self { db, conn };
+        let store = Self { db: Arc::new(db) };
         store.init_schema().await?;
 
         Ok(store)
@@ -157,14 +154,16 @@ impl StateStore {
 
     /// Initialize the database schema.
     async fn init_schema(&self) -> Result<()> {
+        let conn = self.db.connect()?;
+
         // 1. Init Core Schema
-        self.conn
+        conn
             .execute_batch(INIT_SCHEMA_CORE)
             .await
             .with_context(|| "Failed to initialize database core schema")?;
 
         // 2. Init FTS Schema (may fail if extension missing)
-        if let Err(e) = self.conn.execute_batch(INIT_SCHEMA_FTS).await {
+        if let Err(e) = conn.execute_batch(INIT_SCHEMA_FTS).await {
             let err_str = e.to_string();
             if err_str.contains("no such module: fts5") {
                 eprintln!("[WARN] FTS5 extension not available. Hybrid search will be degraded.");
@@ -174,29 +173,23 @@ impl StateStore {
         }
 
         // Check current version
-        let version: u32 = self.get_schema_version().await?.unwrap_or(0);
+        let version: u32 = self.get_schema_version(&conn).await?.unwrap_or(0);
 
         if version < 2 {
             // Migration v1 -> v2: Add FTS5 and backfill
-            // We reuse the FTS schema string, but also need backfill.
-            // If FTS creation failed above, we should probably skip this or warn.
-            
-            // Re-attempt FTS creation (idempotent due to IF NOT EXISTS) just in case, or skipping if we know it failed?
-            // Actually, execute_batch above likely created it if possible.
-            // We just need to trigger rebuild IF it exists.
             
             // Simple check: see if table exists
-            let table_exists = self.conn.query("SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'", ()).await?.next().await?.is_some();
+            let table_exists = conn.query("SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'", ()).await?.next().await?.is_some();
             
             if table_exists {
-                 self.conn.execute_batch(r#"
+                 conn.execute_batch(r#"
                     INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
                 "#).await.context("Failed to rebuild FTS index during migration")?;
             }
         }
 
         // Record schema version
-        self.conn
+        conn
             .execute(
                 "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', ?1)",
                 [SCHEMA_VERSION.to_string()],
@@ -206,8 +199,8 @@ impl StateStore {
         Ok(())
     }
 
-    async fn get_schema_version(&self) -> Result<Option<u32>> {
-        let mut rows = self.conn.query("SELECT value FROM schema_info WHERE key = 'version'", ()).await?;
+    async fn get_schema_version(&self, conn: &Connection) -> Result<Option<u32>> {
+        let mut rows = conn.query("SELECT value FROM schema_info WHERE key = 'version'", ()).await?;
         if let Some(row) = rows.next().await? {
             let v_str: String = row.get(0)?;
             Ok(v_str.parse().ok())
@@ -225,8 +218,9 @@ impl StateStore {
         event_type: &str,
         payload: &serde_json::Value,
     ) -> Result<()> {
+        let conn = self.db.connect()?;
         let payload_str = serde_json::to_string(payload)?;
-        self.conn
+        conn
             .execute(
                 "INSERT INTO events (session_id, event_type, payload) VALUES (?1, ?2, ?3)",
                 turso::params![session_id, event_type, payload_str],
@@ -238,8 +232,8 @@ impl StateStore {
 
     /// Get all events for a session, ordered by creation time.
     pub async fn get_events(&self, session_id: &str) -> Result<Vec<EventRow>> {
-        let mut rows = self
-            .conn
+        let conn = self.db.connect()?;
+        let mut rows = conn
             .query(
                 "SELECT id, session_id, event_type, payload, created_at FROM events WHERE session_id = ?1 ORDER BY id",
                 [session_id],
@@ -261,8 +255,8 @@ impl StateStore {
 
     /// List recent sessions, ordered by last activity.
     pub async fn list_sessions(&self, limit: usize, offset: usize) -> Result<Vec<String>> {
-        let mut rows = self
-            .conn
+        let conn = self.db.connect()?;
+        let mut rows = conn
             .query(
                 "SELECT session_id FROM events GROUP BY session_id ORDER BY MAX(id) DESC LIMIT ?1 OFFSET ?2",
                 turso::params![limit as i64, offset as i64],
@@ -287,8 +281,9 @@ impl StateStore {
         content: &serde_json::Value,
         token_count: Option<u64>,
     ) -> Result<()> {
+        let conn = self.db.connect()?;
         let content_str = serde_json::to_string(content)?;
-        self.conn
+        conn
             .execute(
                 "INSERT INTO messages (session_id, turn_index, role, content, token_count) VALUES (?1, ?2, ?3, ?4, ?5)",
                 turso::params![
@@ -306,8 +301,8 @@ impl StateStore {
 
     /// Get all messages for a session.
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<MessageRow>> {
-        let mut rows = self
-            .conn
+        let conn = self.db.connect()?;
+        let mut rows = conn
             .query(
                 "SELECT id, session_id, turn_index, role, content, token_count, created_at FROM messages WHERE session_id = ?1 ORDER BY id",
                 [session_id],
@@ -344,8 +339,9 @@ impl StateStore {
         duration_ms: Option<u64>,
         verdict: &str,
     ) -> Result<()> {
+        let conn = self.db.connect()?;
         let args_str = serde_json::to_string(args)?;
-        self.conn
+        conn
             .execute(
                 "INSERT INTO tool_executions (session_id, turn_index, tool_call_id, tool_name, args, output, is_error, duration_ms, verdict) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 turso::params![
@@ -367,8 +363,8 @@ impl StateStore {
 
     /// Get all tool executions for a session.
     pub async fn get_tool_executions(&self, session_id: &str) -> Result<Vec<ToolExecutionRow>> {
-        let mut rows = self
-            .conn
+        let conn = self.db.connect()?;
+        let mut rows = conn
             .query(
                 "SELECT id, session_id, turn_index, tool_call_id, tool_name, args, output, is_error, duration_ms, verdict, created_at FROM tool_executions WHERE session_id = ?1 ORDER BY id",
                 [session_id],
@@ -411,8 +407,9 @@ impl StateStore {
         }
 
         let metadata_str = serde_json::to_string(metadata)?;
-
-        self.conn
+        
+        let conn = self.db.connect()?;
+        conn
             .execute(
                 "INSERT INTO memories (session_id, content, embedding, metadata) VALUES (?1, ?2, ?3, ?4)",
                 turso::params![
@@ -446,6 +443,8 @@ impl StateStore {
         let mut scores: HashMap<i64, f64> = HashMap::new();
         let mut rows_data: HashMap<i64, MemoryRow> = HashMap::new();
 
+        let conn = self.db.connect()?;
+
         // 1. Vector Search
         if let Some(vec) = vector {
             // Convert to bytes
@@ -454,7 +453,7 @@ impl StateStore {
                 vector_bytes.extend_from_slice(&val.to_le_bytes());
             }
 
-            let mut rows = self.conn.query(
+            let mut rows = conn.query(
                 "SELECT id, session_id, content, metadata, created_at, vector_distance_cos(embedding, ?1) as distance 
                  FROM memories 
                  WHERE session_id = ?2 
@@ -491,7 +490,7 @@ impl StateStore {
             // Trim and verify query isn't empty
             let query = query.trim();
             if !query.is_empty() {
-                 match self.conn.query(
+                 match conn.query(
                     "SELECT rowid, rank FROM memories_fts 
                      WHERE memories_fts MATCH ?1 
                      ORDER BY rank 
@@ -506,7 +505,7 @@ impl StateStore {
                             // If we haven't fetched this row's data yet (from vector search), we need to fetch it
                             if !rows_data.contains_key(&id) {
                                     // Fetch full row data
-                                let mut full_row_q = self.conn.query(
+                                let mut full_row_q = conn.query(
                                     "SELECT session_id, content, metadata, created_at FROM memories WHERE id = ?1", 
                                     [id]
                                 ).await?;
@@ -575,7 +574,7 @@ impl StateStore {
                     sql.push_str(&(terms.len() + 2).to_string());
                     params.push(turso::Value::from(limit as i64));
 
-                    let mut rows = self.conn.query(&sql, params).await.context("Failed to execute fallback LIKE search")?;
+                    let mut rows = conn.query(&sql, params).await.context("Failed to execute fallback LIKE search")?;
                     
                      while let Some(row) = rows.next().await? {
                          let id: i64 = row.get(0)?;
@@ -624,7 +623,8 @@ impl StateStore {
             );
         }
 
-        self.conn
+        let conn = self.db.connect()?;
+        conn
             .execute(
                 "INSERT OR REPLACE INTO harness_kv (key, value, updated_at) VALUES (?1, ?2, datetime('now'))",
                 turso::params![key, value],
@@ -636,8 +636,8 @@ impl StateStore {
 
     /// Get a value from the harness store.
     pub async fn kv_get(&self, key: &str) -> Result<Option<String>> {
-        let mut rows = self
-            .conn
+        let conn = self.db.connect()?;
+        let mut rows = conn
             .query(
                 "SELECT value FROM harness_kv WHERE key = ?1 AND (expires_at IS NULL OR expires_at > datetime('now'))",
                 [key],
@@ -653,15 +653,16 @@ impl StateStore {
 
     /// Delete a key from the harness store.
     pub async fn kv_delete(&self, key: &str) -> Result<()> {
-        self.conn
+        let conn = self.db.connect()?;
+        conn
             .execute("DELETE FROM harness_kv WHERE key = ?1", [key])
             .await?;
         Ok(())
     }
 
-    /// Get the database connection (for advanced operations).
-    pub fn connection(&self) -> &Connection {
-        &self.conn
+    /// Get a new database connection (for advanced operations).
+    pub fn get_connection(&self) -> Result<Connection> {
+        self.db.connect().map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))
     }
 
     /// Get the underlying database (for advanced ops, e.g. shutdown).
@@ -734,8 +735,8 @@ mod tests {
         let store = StateStore::open_memory().await.unwrap();
 
         // Check schema version
-        let mut rows = store
-            .conn
+        let conn = store.get_connection().unwrap();
+        let mut rows = conn
             .query("SELECT value FROM schema_info WHERE key = 'version'", ())
             .await
             .unwrap();
@@ -920,7 +921,8 @@ mod tests {
         let store = StateStore::open_memory().await.expect("Failed to open state store");
 
         // Check if FTS5 table was created (init_schema logs warning but doesn't fail if missing)
-        let fts_available = store.conn
+        let conn = store.get_connection().unwrap();
+        let fts_available = conn
             .query("SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'", ())
             .await
             .unwrap()

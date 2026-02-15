@@ -20,7 +20,7 @@ use std::collections::{HashMap, VecDeque};
 pub struct HarnessAppData {
     pub fs_root: PathBuf,
     pub workspace_root: PathBuf,
-    pub state_store: Option<Arc<Mutex<StateStore>>>,
+    pub state_store: Option<StateStore>,
     pub clients: HashMap<String, ProviderClient>,
     pub embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     pub queue: Arc<Mutex<VecDeque<String>>>,
@@ -195,7 +195,6 @@ fn register_db_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()> {
                     let store = store.clone();
                     let result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            let store = store.lock().await;
                             store.kv_get(&key).await
                         })
                     });
@@ -218,7 +217,6 @@ fn register_db_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()> {
                     let store = store.clone();
                     let result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            let store = store.lock().await;
                             store.kv_set(&key, &value).await
                         })
                     });
@@ -291,7 +289,6 @@ fn register_session_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()
                     let store = store.clone();
                     let result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            let store = store.lock().await;
                             store.list_sessions(limit, offset).await
                         })
                     });
@@ -314,7 +311,6 @@ fn register_session_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()
                     let store = store.clone();
                     let result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            let store = store.lock().await;
                             store.get_messages(&id).await
                         })
                     });
@@ -516,7 +512,6 @@ fn register_bedrock_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()
                              
                              // 2. Insert into DB
                              if let Some(store) = &store {
-                                 let store = store.lock().await;
                                  store.insert_memory("current_session", &content, &embedding.vector, &metadata_json).await
                                      .map_err(|e| format!("DB insert failed: {}", e))?;
                                  Ok(true)
@@ -566,7 +561,6 @@ fn register_bedrock_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()
 
                             // 2. Search DB
                             if let Some(store) = &store {
-                                let store = store.lock().await;
                                 // Pass vector (if successfully generated) and query (for FTS or fallback)
                                 // We always pass Some(query) now, to allow FTS/LIKE fallback
                                 let results = store.search_memories("current_session", vector.as_deref(), Some(&query), limit).await
@@ -648,8 +642,7 @@ fn register_agent_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()> 
                     // Inject shared components
                     kernel.clients = clients;
                     if let Some(s) = state_store {
-                         let guard = s.lock().await;
-                         kernel.state = Some(guard.clone());
+                         kernel.state = Some(s);
                     }
                     
                     // Init harness for sub-kernel

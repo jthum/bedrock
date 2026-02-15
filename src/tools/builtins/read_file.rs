@@ -74,7 +74,17 @@ pub(crate) fn validate_workspace_path(
     path: &std::path::Path,
     workspace_root: &std::path::Path,
 ) -> Result<(), ToolError> {
-    // Canonicalize the workspace root once
+    // 1. Check for '..' components to prevent traversal in non-existent paths
+    for component in path.components() {
+        if component == std::path::Component::ParentDir {
+             return Err(ToolError::PermissionDenied(format!(
+                 "Path traversal (..) not allowed in '{}'",
+                 path.display()
+             )));
+        }
+    }
+
+    // 2. Canonicalize the workspace root
     let canonical_root = workspace_root.canonicalize().map_err(|e| {
         ToolError::ExecutionError(format!(
             "Failed to canonicalize workspace root '{}': {}",
@@ -83,31 +93,25 @@ pub(crate) fn validate_workspace_path(
         ))
     })?;
 
-    // Resolving the path to check.
-    // If the path exists, canonicalize it.
-    // If it doesn't exist, we need to check its parent.
-    let canonical_path = if path.exists() {
-        path.canonicalize().map_err(|e| {
-            ToolError::ExecutionError(format!("Failed to canonicalize path '{}': {}", path.display(), e))
-        })?
-    } else {
-        // For non-existent files (e.g. write_file to new file), check the parent dir
-        let parent = path.parent().ok_or_else(|| {
-            ToolError::PermissionDenied(format!(
-                "Cannot write to root path '{}'",
-                path.display()
-            ))
-        })?;
+    // 3. Find the first existing ancestor
+    let mut current = path.to_path_buf();
+    while !current.exists() {
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+             // Reached root and it doesn't exist?
+             // If the root of the file system doesn't exist, we have bigger problems.
+             // But logical roots might not exist in some environments?
+             // Just break and try to canonicalize what we have.
+             break;
+        }
+    }
+    
+    let canonical_current = current.canonicalize().map_err(|e| {
+        ToolError::ExecutionError(format!("Failed to canonicalize path ancestor '{}': {}", current.display(), e))
+    })?;
 
-        let canonical_parent = parent.canonicalize().map_err(|e| {
-            ToolError::ExecutionError(format!("Failed to canonicalize parent directory '{}': {}", parent.display(), e))
-        })?;
-
-        // Construct the theoretical canonical path
-        canonical_parent.join(path.file_name().unwrap_or_default())
-    };
-
-    if !canonical_path.starts_with(&canonical_root) {
+    if !canonical_current.starts_with(&canonical_root) {
         return Err(ToolError::PermissionDenied(format!(
             "Path '{}' is outside workspace root '{}'",
             path.display(),

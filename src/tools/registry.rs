@@ -113,6 +113,6 @@ mod tests {
     fn test_duplicate_registration_panics() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(builtins::ReadFileTool)).unwrap();
-        registry.register(Box::new(builtins::ReadFileTool)); // should panic
+        registry.register(Box::new(builtins::ReadFileTool)).unwrap(); // should panic
     }
 }

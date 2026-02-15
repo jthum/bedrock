@@ -278,6 +278,9 @@ api_key_env = "OPENAI_API_KEY"
 [agent]
 model = "gpt-4o"
 provider = "openai"
+
+[providers.openai]
+type = "openai"
 "#;
 
         let config = BedrockConfig::from_str(toml).unwrap();
@@ -318,6 +321,9 @@ base_url = "https://my-proxy.example.com/v1"
 model = "test"
 provider = "anthropic"
 
+[providers.anthropic]
+type = "anthropic"
+
 [kernel]
 workspace_root = "src"
 "#;
@@ -333,6 +339,9 @@ workspace_root = "src"
 [agent]
 model = "test"
 provider = "anthropic"
+
+[providers.anthropic]
+type = "anthropic"
 
 [kernel]
 workspace_root = "/absolute/path"

@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
             config,
             model,
             provider,
-            verbose,
+            verbose: _,
             json,
         } => {
             // Load config
@@ -244,7 +244,6 @@ async fn main() -> Result<()> {
                         println!("Error: {:?}", err);
                         break;
                     }
-                }
                 }
             }
             kernel.end_session().await?;

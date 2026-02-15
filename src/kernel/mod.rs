@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{info, warn, error, debug, instrument};
+use futures::future::join_all;
 use std::collections::{HashMap, VecDeque};
 
 use crate::harness::engine::HarnessEngine;
@@ -173,9 +174,7 @@ impl Kernel {
         let app_data = HarnessAppData {
             fs_root,
             workspace_root: PathBuf::from(&self.config.kernel.workspace_root),
-            state_store: self.state.as_ref().map(|s| {
-                Arc::new(Mutex::new(s.clone()))
-            }),
+            state_store: self.state.clone(),
             clients: self.clients.clone(),
             embedding_provider: self.embedding_provider.clone(),
             queue: self.queue.clone(),
@@ -231,7 +230,7 @@ impl Kernel {
         let app_data = HarnessAppData {
             fs_root,
             workspace_root: PathBuf::from(&config.kernel.workspace_root),
-            state_store: state.as_ref().map(|s| Arc::new(Mutex::new(s.clone()))),
+            state_store: state.clone(),
             clients,
             embedding_provider,
             queue,
@@ -666,27 +665,25 @@ impl Kernel {
             }
 
             // Execute tools
+            // Phase 1: Evaluate verdicts (Sequential to handle user interaction safe)
+            let mut validated_calls = Vec::new();
             let mut tool_results: Vec<InferenceContent> = Vec::new();
-            for tc in &pending_tool_calls {
-                info!(tool = %tc.name, id = %tc.id, "Executing tool");
-                let verdict = self.evaluate_tool_call(&tc.name, &tc.id, &tc.args).await;
-                let verdict_str = verdict.to_string();
-                let mut final_args = tc.args.clone();
 
+            for tc in &pending_tool_calls {
+                let verdict = self.evaluate_tool_call(&tc.name, &tc.id, &tc.args).await;
                 match &verdict {
-                     Verdict::Reject(reason) => {
+                    Verdict::Reject(reason) => {
                          warn!(tool = %tc.name, reason = %reason, "Tool REJECTED by harness");
-                          self.persist_event(&session_id, &KernelEvent::ToolExecStart { id: tc.id.clone(), name: tc.name.clone() }).await;
-                          self.persist_event(&session_id, &KernelEvent::ToolExecEnd { id: tc.id.clone(), success: false }).await;
-                          let msg = format!("[HARNESS REJECTED] Tool '{}' blocked: {}", tc.name, reason);
-                          
-                           if let Some(ref store) = self.state {
-                                let _ = store.insert_tool_execution(&session_id, self.turn_index, &tc.id, &tc.name, &tc.args, Some(&msg), true, Some(0), &verdict_str).await;
-                           }
-                           tool_results.push(InferenceContent::ToolResult { tool_use_id: tc.id.clone(), content: msg, is_error: true });
-                           continue;
-                     }
-                     Verdict::Escalate(reason) => {
+                         self.persist_event(&session_id, &KernelEvent::ToolExecStart { id: tc.id.clone(), name: tc.name.clone() }).await;
+                         self.persist_event(&session_id, &KernelEvent::ToolExecEnd { id: tc.id.clone(), success: false }).await;
+                         let msg = format!("[HARNESS REJECTED] Tool '{}' blocked: {}", tc.name, reason);
+                         
+                         if let Some(ref store) = self.state {
+                              let _ = store.insert_tool_execution(&session_id, self.turn_index, &tc.id, &tc.name, &tc.args, Some(&msg), true, Some(0), &verdict.to_string()).await;
+                         }
+                         tool_results.push(InferenceContent::ToolResult { tool_use_id: tc.id.clone(), content: msg, is_error: true });
+                    }
+                    Verdict::Escalate(reason) => {
                          warn!(tool = %tc.name, reason = %reason, "ESCALATION: Tool requires approval");
                          eprint!("[bedrock] Allow? (y/n): ");
                          io::stderr().flush().ok();
@@ -701,29 +698,64 @@ impl Kernel {
                                     let _ = store.insert_tool_execution(&session_id, self.turn_index, &tc.id, &tc.name, &tc.args, Some(&msg), true, Some(0), "escalate_denied").await;
                                }
                                tool_results.push(InferenceContent::ToolResult { tool_use_id: tc.id.clone(), content: msg, is_error: true });
-                               continue;
+                         } else {
+                             info!(tool = %tc.name, "Tool APPROVED by user");
+                             validated_calls.push((tc, verdict)); // Verdict is technically Escalate but approved, treat as Allow
                          }
-                         info!(tool = %tc.name, "Tool APPROVED by user");
-                     }
-                     Verdict::Allow => {}
-                     Verdict::Modify(new_args) => {
-                         info!(tool = %tc.name, "Tool arguments MODIFIED by harness");
-                         final_args = new_args.clone();
-                     }
+                    }
+                    Verdict::Allow | Verdict::Modify(_) => {
+                        validated_calls.push((tc, verdict));
+                    }
                 }
-                
-                self.persist_event(&session_id, &KernelEvent::ToolExecStart { id: tc.id.clone(), name: tc.name.clone() }).await;
-                let start = Instant::now();
-                let (mut content, mut is_error, metadata) = match self.tool_registry.execute(&tc.name, final_args, &tool_ctx).await {
-                    Ok(o) => (o.content, false, o.metadata),
-                    Err(e) => (format!("Tool error: {}", e), true, serde_json::Value::Null),
-                };
+            }
 
+            // Phase 2: Parallel Execution
+            // Reborrow self immutably to allow capture in multiple futures
+            let kernel = &*self;
+            let futures = validated_calls.into_iter().map(|(tc, verdict)| {
+                let session_id = session_id.clone();
+                let tool_ctx = tool_ctx.clone();
+                async move {
+                    let verdict_str = verdict.to_string();
+                    let final_args = match verdict {
+                        Verdict::Modify(new_args) => {
+                             info!(tool = %tc.name, "Tool arguments MODIFIED by harness");
+                             new_args
+                        },
+                        _ => tc.args.clone()
+                    };
+
+                    kernel.persist_event(&session_id, &KernelEvent::ToolExecStart { id: tc.id.clone(), name: tc.name.clone() }).await;
+                    let start = Instant::now();
+                    let (content, is_error, metadata) = match kernel.tool_registry.execute(&tc.name, final_args, &tool_ctx).await {
+                        Ok(o) => (o.content, false, o.metadata),
+                        Err(e) => (format!("Tool error: {}", e), true, serde_json::Value::Null),
+                    };
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    
+                    kernel.persist_event(&session_id, &KernelEvent::ToolExecEnd { id: tc.id.clone(), success: !is_error }).await;
+
+                    if let Some(ref store) = kernel.state {
+                         let _ = store.insert_tool_execution(&session_id, kernel.turn_index, &tc.id, &tc.name, &tc.args, Some(&content), is_error, Some(duration_ms), &verdict_str).await;
+                    }
+
+                    (tc, content, is_error, metadata)
+                }
+            });
+
+            let execution_results = join_all(futures).await;
+
+            // Phase 3: Side Effects & Result Collection
+            for (tc, mut content, mut is_error, metadata) in execution_results {
+                
                 // Intercept "submit_task" action
                 if !is_error {
                     if let Some(action) = metadata.get("action").and_then(|v| v.as_str()) {
                         if action == "submit_task" {
-                            let verdict_result = {
+                            // ... existing submit_task logic (shortened for brevity, it uses self.harness and self.queue)
+                            // We need to implement the full logic here or extract it.
+                            // For now, I'll inline the simplified logic or copy the original.
+                             let verdict_result = {
                                 let harness = self.harness.lock().await;
                                 if let Some(engine) = &*harness {
                                     Some(engine.evaluate("on_task_submit", metadata.clone()))
@@ -733,20 +765,13 @@ impl Kernel {
                             if let Some(result) = verdict_result {
                                 match result {
                                     Ok(Verdict::Allow) => {
-                                        // Proceed with queuing
                                         if let Some(subtasks) = metadata.get("subtasks").and_then(|v| v.as_array()) {
                                             if let Some(clear) = metadata.get("clear_existing").and_then(|v| v.as_bool()) {
-                                                if clear {
-                                                    let mut q = self.queue.lock().await;
-                                                    q.clear();
-                                                }
+                                                if clear { self.queue.lock().await.clear(); }
                                             }
-                                            
                                             let mut q = self.queue.lock().await;
                                             for task in subtasks {
-                                                if let Some(t) = task.as_str() {
-                                                    q.push_back(t.to_string());
-                                                }
+                                                if let Some(t) = task.as_str() { q.push_back(t.to_string()); }
                                             }
                                             debug!("tasks queued from submit_task");
                                         }
@@ -754,19 +779,13 @@ impl Kernel {
                                     Ok(Verdict::Modify(new_tasks_val)) => {
                                          if let Some(new_tasks) = new_tasks_val.as_array() {
                                               let mut q = self.queue.lock().await;
-                                              
                                               if let Some(clear) = metadata.get("clear_existing").and_then(|v| v.as_bool()) {
                                                   if clear { q.clear(); }
                                               }
-
                                               for task in new_tasks {
-                                                  if let Some(t) = task.as_str() {
-                                                      q.push_back(t.to_string());
-                                                  }
+                                                  if let Some(t) = task.as_str() { q.push_back(t.to_string()); }
                                               }
                                                debug!("tasks queued (MODIFIED by harness)");
-                                          } else {
-                                              warn!("Verdict::Modify returned non-array value, ignoring");
                                           }
                                     },
                                     Ok(Verdict::Reject(reason)) => {
@@ -774,64 +793,39 @@ impl Kernel {
                                     },
                                     Ok(Verdict::Escalate(reason)) => {
                                          content = format!("Plan paused for approval: {}", reason);
-                                         // Logic for escalation could go here if needed
                                     },
-                                    Err(e) => {
-                                         error!(error = %e, "Failed to evaluate on_task_submit");
-                                    }
+                                    Err(e) => { error!(error = %e, "Failed to evaluate on_task_submit"); }
                                 }
                             } else {
-                                // No harness, just queue it
                                 if let Some(subtasks) = metadata.get("subtasks").and_then(|v| v.as_array()) {
                                      let mut q = self.queue.lock().await;
                                      if let Some(clear) = metadata.get("clear_existing").and_then(|v| v.as_bool()) {
                                         if clear { q.clear(); }
                                      }
                                      for task in subtasks {
-                                        if let Some(t) = task.as_str() {
-                                            q.push_back(t.to_string());
-                                        }
+                                        if let Some(t) = task.as_str() { q.push_back(t.to_string()); }
                                      }
                                 }
                             }
                         } else if action == "spawn_mcp" {
-                        // Handle MCP connection request
-                        if let Some(cmd) = metadata.get("command").and_then(|v| v.as_str()) {
-                             let args: Vec<String> = metadata.get("args")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect())
-                                .unwrap_or_default();
-                             
-                             match self.spawn_mcp_server(cmd, &args).await {
-                                 Ok(count) => {
-                                     content = format!("Successfully connected to MCP server. Loaded {} new tools.", count);
-                                     // Re-fetch tools for next loop iteration
-                                     // Note: `tools` var in this loop is stale. But `self.tool_registry` is updated.
-                                     // We should break/restart loop or just know that next turn uses new tools?
-                                     // The `run_task` loop re-reads `tools` per turn (see line ~354).
-                                     // This ensures that any tools dynamically registered via MCP mid-session 
-                                     // are available in the next LLM turn.
-                                     // We MUST update `tools` variable here for the model to see them in next turn!
-                                     
-                                     // However, `tools` is `Vec<ToolDefinition>`. We need to re-fetch.
-                                     // But `tools` variable is defined outside the loop.
-                                     // We can't update `tools` easily because of scope. 
-                                     // Ideally, `run_task` loop gets fresh tools each turn.
-                                 },
-                                 Err(e) => {
-                                     content = format!("Failed to connect to MCP server: {}", e);
-                                     is_error = true;
-                                 }
+                             if let Some(cmd) = metadata.get("command").and_then(|v| v.as_str()) {
+                                  let args: Vec<String> = metadata.get("args")
+                                     .and_then(|v| v.as_array())
+                                     .map(|arr| arr.iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect())
+                                     .unwrap_or_default();
+                                  
+                                  match self.spawn_mcp_server(cmd, &args).await {
+                                      Ok(count) => {
+                                          content = format!("Successfully connected to MCP server. Loaded {} new tools.", count);
+                                      },
+                                      Err(e) => {
+                                          content = format!("Failed to connect to MCP server: {}", e);
+                                          is_error = true;
+                                      }
+                                  }
                              }
                         }
                     }
-                    }
-                }
-                let duration_ms = start.elapsed().as_millis() as u64;
-                self.persist_event(&session_id, &KernelEvent::ToolExecEnd { id: tc.id.clone(), success: !is_error }).await;
-
-                if let Some(ref store) = self.state {
-                     let _ = store.insert_tool_execution(&session_id, self.turn_index, &tc.id, &tc.name, &tc.args, Some(&content), is_error, Some(duration_ms), &verdict_str).await;
                 }
                 tool_results.push(InferenceContent::ToolResult { tool_use_id: tc.id.clone(), content, is_error });
             }
