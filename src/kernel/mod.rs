@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
+use tracing::{info, warn, error, debug, instrument};
 use std::collections::{HashMap, VecDeque};
 
 use crate::harness::engine::HarnessEngine;
@@ -36,7 +37,6 @@ use notify::{RecommendedWatcher, Event};
 /// Harness scripts define the behavior.
 pub struct Kernel {
     pub config: BedrockConfig,
-    pub verbose: bool,
     pub json: bool,
     pub tool_registry: ToolRegistry,
     pub state: Option<StateStore>,
@@ -68,11 +68,10 @@ struct PendingToolCall {
 
 impl Kernel {
     /// Create a new Kernel with the given configuration.
-    pub fn new(config: BedrockConfig, verbose: bool, json: bool) -> Self {
+    pub fn new(config: BedrockConfig, json: bool) -> Self {
         let tool_registry = create_default_registry();
         Self {
             config,
-            verbose,
             json,
             tool_registry,
             state: None,
@@ -154,14 +153,16 @@ impl Kernel {
             format!("Failed to initialize state store at '{}'", db_path)
         })?;
         if self.verbose {
-            eprintln!("[bedrock] State store initialized: {}", db_path);
+            info!(db_path = %db_path, "State store initialized");
         }
         self.state = Some(store);
         Ok(())
     }
 
     /// Initialize the harness engine. Call after `init_state()` and before `run()`.
+    #[instrument(skip(self), fields(directory = %self.config.harness.directory))]
     pub async fn init_harness(&mut self) -> Result<()> {
+        info!("Initializing harness");
         let harness_dir = PathBuf::from(&self.config.harness.directory);
 
         // Resolve fs_root: "." means workspace root, otherwise use as-is
@@ -175,7 +176,6 @@ impl Kernel {
             fs_root,
             workspace_root: PathBuf::from(&self.config.kernel.workspace_root),
             state_store: self.state.as_ref().map(|s| {
-                // This is safe because harness evaluation is synchronous and brief.
                 Arc::new(Mutex::new(s.clone()))
             }),
             clients: self.clients.clone(),
@@ -191,19 +191,13 @@ impl Kernel {
             .with_context(|| format!("Failed to load harness scripts from '{}'", harness_dir.display()))?;
 
         let script_count = engine.loaded_scripts().len();
-        if self.verbose {
-            if script_count > 0 {
-                eprintln!(
-                    "[bedrock] Harness loaded: {} script(s) from '{}'",
-                    script_count,
-                    harness_dir.display()
-                );
-                for name in engine.loaded_scripts() {
-                    eprintln!("[bedrock]   - {}.lua", name);
-                }
-            } else {
-                eprintln!("[bedrock] No harness scripts found in '{}'", harness_dir.display());
+        if script_count > 0 {
+            info!(count = script_count, directory = %harness_dir.display(), "Harness scripts loaded");
+            for name in engine.loaded_scripts() {
+                debug!(script = %name, "Loaded harness script");
             }
+        } else {
+            warn!(directory = %harness_dir.display(), "No harness scripts found");
         }
 
         {
@@ -214,30 +208,22 @@ impl Kernel {
     }
 
     /// Reload the harness from disk (atomic swap).
-    pub async fn reload_harness(&self) -> Result<()> {
-        Self::reload_harness_static(
-            self.harness.clone(),
-            self.config.clone(),
-            self.clients.clone(),
-            self.state.clone(),
-            self.embedding_provider.clone(),
-            self.queue.clone(),
-            self.verbose,
-        ).await
+    #[instrument(skip(self))]
+    pub async fn reload_harness(&mut self) -> Result<()> {
+        info!("Reloading harness");
+        self.init_harness().await
     }
 
-    /// Static version of reload_harness that can be called from background tasks.
+    #[instrument(skip_all)]
     pub async fn reload_harness_static(
-        harness_lock: Arc<Mutex<Option<HarnessEngine>>>,
+        harness: Arc<Mutex<Option<HarnessEngine>>>,
         config: BedrockConfig,
         clients: HashMap<String, ProviderClient>,
         state: Option<StateStore>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
         queue: Arc<Mutex<VecDeque<String>>>,
-        verbose: bool
     ) -> Result<()> {
         let harness_dir = PathBuf::from(&config.harness.directory);
-        
         let fs_root = if config.harness.fs_root == "." {
             PathBuf::from(&config.kernel.workspace_root)
         } else {
@@ -247,58 +233,46 @@ impl Kernel {
         let app_data = HarnessAppData {
             fs_root,
             workspace_root: PathBuf::from(&config.kernel.workspace_root),
-            state_store: state.as_ref().map(|s| {
-                Arc::new(Mutex::new(s.clone()))
-            }),
-            clients: clients.clone(),
-            embedding_provider: embedding_provider.clone(),
-            queue: queue.clone(),
-            config: Arc::new(config.clone()),
+            state_store: state.as_ref().map(|s| Arc::new(Mutex::new(s.clone()))),
+            clients,
+            embedding_provider,
+            queue,
+            config: Arc::new(config),
         };
 
         match HarnessEngine::new(app_data) {
             Ok(mut engine) => {
-                 match engine.load_dir(&harness_dir) {
-                     Ok(_) => {
-                         let script_count = engine.loaded_scripts().len();
-                         let mut h = harness_lock.lock().await;
-                         *h = Some(engine);
-                         if verbose {
-                             eprintln!("[bedrock] Harness reloaded: {} scripts", script_count);
-                         }
-                         Ok(())
-                     },
-                     Err(e) => {
-                         eprintln!("[bedrock] Failed to load harness scripts: {}", e);
-                         Err(e)
-                     }
-                 }
-            },
-            Err(e) => {
-                eprintln!("[bedrock] Failed to create harness engine: {}", e);
-                Err(e)
+                match engine.load_dir(&harness_dir) {
+                    Ok(_) => {
+                        let script_count = engine.loaded_scripts().len();
+                        let mut h = harness.lock().await;
+                        *h = Some(engine);
+                        info!(count = script_count, "Harness reloaded successfully");
+                    }
+                    Err(e) => error!(error = %e, "Failed to load harness scripts"),
+                }
             }
+            Err(e) => error!(error = %e, "Failed to create harness engine during static reload"),
         }
+        Ok(())
     }
 
     /// Start watching the harness directory for changes (background thread).
-    pub fn start_watcher(&mut self) -> Result<()> {
+    #[instrument(skip(self))]
+    pub fn start_watcher(&self) -> Result<()> {
         use notify::{RecursiveMode, Watcher};
         use std::time::Duration;
 
-        let harness_lock = self.harness.clone();
-        let config = self.config.clone();
-        let clients = self.clients.clone();
-        let state = self.state.clone();
-        let embedding_provider = self.embedding_provider.clone();
-        let queue = self.queue.clone();
-        let verbose = self.verbose;
-        let harness_dir = PathBuf::from(&config.harness.directory);
+        let harness_clone = self.harness.clone();
+        let config_clone = self.config.clone();
+        let clients_clone = self.clients.clone();
+        let state_clone = self.state.clone();
+        let embedding_clone = self.embedding_provider.clone();
+        let queue_clone = self.queue.clone();
+        let harness_dir = PathBuf::from(&config_clone.harness.directory);
 
         if !harness_dir.exists() {
-            if verbose {
-                eprintln!("[bedrock] Harness directory does not exist, skipping watcher: {}", harness_dir.display());
-            }
+            warn!(directory = %harness_dir.display(), "Harness directory does not exist, skipping watcher");
             return Ok(());
         }
 
@@ -313,19 +287,19 @@ impl Kernel {
                 // Clear any pending events that arrived during sleep
                 while let Ok(_) = rx.try_recv() {}
 
-                if verbose {
-                    eprintln!("[bedrock] Hot-reload triggered by file change...");
-                }
-
-                let _ = Self::reload_harness_static(
-                    harness_lock.clone(),
-                    config.clone(),
-                    clients.clone(),
-                    state.clone(),
-                    embedding_provider.clone(),
-                    queue.clone(),
-                    verbose,
-                ).await;
+                info!("Hot-reload triggered by file change");
+                let h = harness_clone.clone();
+                let c = config_clone.clone();
+                let cl = clients_clone.clone();
+                let s = state_clone.clone();
+                let e = embedding_clone.clone();
+                let q = queue_clone.clone();
+                
+                tokio::spawn(async move {
+                    if let Err(err) = Self::reload_harness_static(h, c, cl, s, e, q).await {
+                        error!(error = %err, "Harness hot-reload failed");
+                    }
+                });
             }
         });
 
@@ -336,16 +310,14 @@ impl Kernel {
                         let _ = tx.blocking_send(());
                     }
                 }
-                Err(e) => eprintln!("[bedrock] Watcher error: {:?}", e),
+                Err(e) => error!(error = ?e, "Watcher channel error"),
             }
         })?;
 
         watcher.watch(&harness_dir, RecursiveMode::NonRecursive)?;
         self.check_watcher = Some(watcher);
 
-        if verbose {
-            eprintln!("[bedrock] Watching harness directory: {}", harness_dir.display());
-        }
+        info!(directory = %harness_dir.display(), "Watching harness directory");
 
         Ok(())
     }
@@ -369,99 +341,101 @@ impl Kernel {
     ///
     /// If `initial_prompt` is provided, it is added to the queue first.
     /// The function returns when the queue is clear.
+    #[instrument(skip(self, initial_prompt), fields(session_id = %self.session_id))]
     pub async fn run(&mut self, initial_prompt: Option<String>) -> Result<()> {
-         if let Some(prompt) = initial_prompt {
-             self.queue_prompt(prompt).await;
-         }
-         
-         // ─── Harness Hook: on_agent_start ────────────────────────────
-         // Run only at the beginning of the session
-             if self.turn_index == 0 {
-                 self.persist_event(&self.session_id.clone(), &KernelEvent::AgentStart {
-                    session_id: self.session_id.clone(),
-                 }).await;
-    
-                 {
-                    let harness = self.harness.lock().await;
-                    if let Some(ref engine) = *harness {
-                        use crate::harness::verdict::Verdict;
-                        let verdict = engine.evaluate(
-                            "on_agent_start",
-                            serde_json::json!({ "session_id": self.session_id }),
-                        )?;
-                        if let Verdict::Reject(reason) = verdict {
-                            eprintln!("[bedrock] Session rejected by harness: {}", reason);
-                            return Ok(());
-                        }
+        if self.turn_index == 0 {
+            info!(session_id = %self.session_id, "Starting new agent session");
+            self.persist_event(&self.session_id.clone(), &KernelEvent::AgentStart {
+                session_id: self.session_id.clone(),
+            }).await;
+
+            {
+                let harness = self.harness.lock().await;
+                if let Some(ref engine) = *harness {
+                    use crate::harness::verdict::Verdict;
+                    let verdict = engine.evaluate(
+                        "on_agent_start",
+                        serde_json::json!({ "session_id": self.session_id }),
+                    )?;
+                    if let Verdict::Reject(reason) = verdict {
+                        warn!(reason = %reason, "Harness rejected action");
+                        return Ok(());
                     }
-                 }
-             }
+                }
+            }
+        }
 
-         loop {
-             // Pop next task
-             let task = {
-                 let mut q = self.queue.lock().await;
-                 q.pop_front()
-             };
+        if let Some(prompt) = initial_prompt {
+            self.queue_prompt(prompt).await;
+        }
+         
+        loop {
+            // Pop next task
+            let task = {
+                let mut q = self.queue.lock().await;
+                if q.is_empty() {
+                    debug!("Queue empty, ending run");
+                    break;
+                }
+                let task = q.pop_front().unwrap();
+                drop(q);
+                
+                info!(task = %task, "Running task");
+                self.run_task(&task).await?;
+            };
+            
+            // ─── Harness Hook: on_task_complete ─────────────────────
+            // Triggered when the queue is explicitly empty.
+            let mut recheck = false;
+            
+            let verdict_result = {
+                let harness = self.harness.lock().await;
+                if let Some(ref engine) = *harness {
+                    let payload = serde_json::json!({
+                        "session_id": self.session_id,
+                        "turn_count": self.turn_index,
+                    });
+                    Some(engine.evaluate("on_task_complete", payload))
+                } else {
+                    None
+                }
+            };
 
-             if let Some(prompt) = task {
-                 if self.verbose {
-                     eprintln!("[bedrock] Starting task: {}", prompt);
-                 }
-                 self.run_task(&prompt).await?;
-             } else {
-                  // ─── Harness Hook: on_task_complete ─────────────────────
-                  // Triggered when the queue is explicitly empty.
-                  let mut recheck = false;
-                  
-                  let verdict_result = {
-                      let harness = self.harness.lock().await;
-                      if let Some(ref engine) = *harness {
-                          let payload = serde_json::json!({
-                              "session_id": self.session_id,
-                              "turn_count": self.turn_index,
-                          });
-                          Some(engine.evaluate("on_task_complete", payload))
-                      } else {
-                          None
-                      }
-                  };
-
-                  if let Some(result) = verdict_result {
-                      match result {
-                           Ok(Verdict::Modify(new_tasks_val)) => {
-                                 if let Some(new_tasks) = new_tasks_val.as_array() {
-                                      if !new_tasks.is_empty() {
-                                          let mut q = self.queue.lock().await;
-                                          for task in new_tasks {
-                                              if let Some(t) = task.as_str() {
-                                                  q.push_back(t.to_string());
-                                              }
-                                          }
-                                          eprintln!("[bedrock] Validation failed or extended. {} new tasks queued.", new_tasks.len());
-                                          recheck = true;
-                                      }
-                                 }
-                           },
-                           Ok(Verdict::Reject(reason)) => {
-                               eprintln!("[bedrock] Session ended with REJECTION: {}", reason);
-                               // We break, effectively ending the session.
-                           },
-                           Ok(_) => {
-                               // Allow or Escalate (ignored at this stage) -> Done.
-                           },
-                           Err(e) => {
-                               if self.verbose { eprintln!("[bedrock] Warning: harness on_task_complete error: {}", e); }
-                           }
-                      }
-                 }
-                 
-                 if recheck {
-                     continue;
-                 }
-                 break;
-             }
-         }
+            if let Some(result) = verdict_result {
+                match result {
+                    Ok(Verdict::Modify(new_tasks_val)) => {
+                        if let Some(new_tasks) = new_tasks_val.as_array() {
+                            if !new_tasks.is_empty() {
+                                let mut q = self.queue.lock().await;
+                                for task in new_tasks {
+                                    if let Some(t) = task.as_str() {
+                                        q.push_back(t.to_string());
+                                    }
+                                }
+                                info!(count = new_tasks.len(), "Validation failed or extended by harness; new tasks queued");
+                                recheck = true;
+                            }
+                        }
+                    },
+                    Ok(Verdict::Reject(reason)) => {
+                        warn!(reason = %reason, "Session ended with REJECTION from harness");
+                        break;
+                    },
+                    Ok(_) => {},
+                    Err(e) => {
+                        warn!(error = %e, "Harness on_task_complete error");
+                    }
+                }
+            }
+            
+            if recheck {
+                continue;
+            }
+            break;
+        }
+        
+        Ok(())
+    }
          
          Ok(())
     }
@@ -483,7 +457,7 @@ impl Kernel {
     }
     
     /// Execute a single task (one specific prompt) within the persistent session.
-    // TODO: Decompose this method into smaller, testable units (e.g. process_stream_event, handle_tool_calls)
+    #[instrument(skip(self, prompt), fields(task = %prompt))]
     async fn run_task(&mut self, prompt: &str) -> Result<()> {
         let session_id = self.session_id.clone();
 
@@ -527,7 +501,7 @@ impl Kernel {
 
         loop {
             if task_turn_count >= max_task_turns {
-                eprintln!("[bedrock] Max turns ({}) reached for this task.", max_task_turns);
+                error!(max_turns = max_task_turns, "Max turns reached for this task");
                 break;
             }
 
@@ -561,12 +535,12 @@ impl Kernel {
                 match engine.evaluate_userdata("on_before_inference", ctx.clone()) {
                     Ok(verdict) => {
                          if verdict.is_rejected() {
-                             eprintln!("[bedrock] 🛑 Turn rejected by harness: {}", verdict.reason().unwrap_or(""));
+                             warn!(reason = %verdict.reason().unwrap_or(""), "Turn rejected by harness");
                              break;
                          }
                     }
                     Err(e) => {
-                         if self.verbose { eprintln!("[bedrock] Warning: harness on_before_inference error: {}", e); }
+                         warn!(error = %e, "Harness on_before_inference error");
                     }
                 }
 
@@ -585,11 +559,11 @@ impl Kernel {
             // Lazy initialization if not present?
             if !self.clients.contains_key(&provider_name) {
                  if let Some(config) = self.config.providers.get(&provider_name) {
-                     if self.verbose { eprintln!("[bedrock] Lazily initializing provider: {}", provider_name); }
+                     debug!(provider = %provider_name, "Lazily initializing provider");
                      match self.create_client(&provider_name, config) {
                          Ok(client) => { self.clients.insert(provider_name.clone(), client); },
                          Err(e) => {
-                             eprintln!("[bedrock] Failed to initialize provider '{}': {}", provider_name, e);
+                             error!(provider = %provider_name, error = %e, "Failed to initialize provider");
                          }
                      }
                  } else {
@@ -702,14 +676,14 @@ impl Kernel {
             // Execute tools
             let mut tool_results: Vec<InferenceContent> = Vec::new();
             for tc in &pending_tool_calls {
-                if self.verbose { eprintln!("[bedrock] Executing tool: {} ({})", tc.name, tc.id); }
+                info!(tool = %tc.name, id = %tc.id, "Executing tool");
                 let verdict = self.evaluate_tool_call(&tc.name, &tc.id, &tc.args).await;
                 let verdict_str = verdict.to_string();
                 let mut final_args = tc.args.clone();
 
                 match &verdict {
                      Verdict::Reject(reason) => {
-                         eprintln!("[bedrock] Tool {} REJECTED: {}", tc.name, reason);
+                         warn!(tool = %tc.name, reason = %reason, "Tool REJECTED by harness");
                           self.persist_event(&session_id, &KernelEvent::ToolExecStart { id: tc.id.clone(), name: tc.name.clone() }).await;
                           self.persist_event(&session_id, &KernelEvent::ToolExecEnd { id: tc.id.clone(), success: false }).await;
                           let msg = format!("[HARNESS REJECTED] Tool '{}' blocked: {}", tc.name, reason);
@@ -721,14 +695,13 @@ impl Kernel {
                            continue;
                      }
                      Verdict::Escalate(reason) => {
-                         eprintln!("\n[bedrock] ⚠ ESCALATION: Tool '{}' requires approval. Reason: {}", tc.name, reason);
+                         warn!(tool = %tc.name, reason = %reason, "ESCALATION: Tool requires approval");
                          eprint!("[bedrock] Allow? (y/n): ");
                          io::stderr().flush().ok();
                          let mut input = String::new();
                          let approved = io::stdin().lock().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y");
-                         // (Abbreviated logic: if approved, fall through. If denied, similar to reject)
                          if !approved {
-                              eprintln!("[bedrock] Tool {} DENIED.", tc.name);
+                              warn!(tool = %tc.name, "Tool DENIED by user");
                               let msg = format!("[ESCALATION DENIED] Tool '{}' denied: {}", tc.name, reason);
                                self.persist_event(&session_id, &KernelEvent::ToolExecStart { id: tc.id.clone(), name: tc.name.clone() }).await;
                                self.persist_event(&session_id, &KernelEvent::ToolExecEnd { id: tc.id.clone(), success: false }).await;
@@ -738,11 +711,11 @@ impl Kernel {
                                tool_results.push(InferenceContent::ToolResult { tool_use_id: tc.id.clone(), content: msg, is_error: true });
                                continue;
                          }
-                         eprintln!("[bedrock] Tool {} APPROVED.", tc.name);
+                         info!(tool = %tc.name, "Tool APPROVED by user");
                      }
                      Verdict::Allow => {}
                      Verdict::Modify(new_args) => {
-                         eprintln!("[bedrock] Tool arguments MODIFIED by harness.");
+                         info!(tool = %tc.name, "Tool arguments MODIFIED by harness");
                          final_args = new_args.clone();
                      }
                 }
@@ -783,7 +756,7 @@ impl Kernel {
                                                     q.push_back(t.to_string());
                                                 }
                                             }
-                                            if self.verbose { eprintln!("[bedrock] tasks queued from submit_task"); }
+                                            debug!("tasks queued from submit_task");
                                         }
                                     },
                                     Ok(Verdict::Modify(new_tasks_val)) => {
@@ -799,10 +772,10 @@ impl Kernel {
                                                       q.push_back(t.to_string());
                                                   }
                                               }
-                                              if self.verbose { eprintln!("[bedrock] tasks queued (MODIFIED by harness)"); }
-                                         } else {
-                                             eprintln!("[bedrock] Verdict::Modify returned non-array value, ignoring.");
-                                         }
+                                               if self.verbose { debug!("tasks queued (MODIFIED by harness)"); }
+                                          } else {
+                                              warn!("Verdict::Modify returned non-array value, ignoring");
+                                          }
                                     },
                                     Ok(Verdict::Reject(reason)) => {
                                         content = format!("Plan REJECTED by Harness: {}", reason);
@@ -812,7 +785,7 @@ impl Kernel {
                                          // Logic for escalation could go here if needed
                                     },
                                     Err(e) => {
-                                        eprintln!("[bedrock] Failed to evaluate on_task_submit: {}", e);
+                                         error!(error = %e, "Failed to evaluate on_task_submit");
                                     }
                                 }
                             } else {
@@ -940,15 +913,14 @@ impl Kernel {
                 "args": args,
             });
             match engine.evaluate("on_tool_call", payload) {
-                Ok(verdict) => {
-                    if self.verbose && !verdict.is_allowed() {
-                        eprintln!("[bedrock] Harness verdict for {}: {}", name, verdict);
+                    if !verdict.is_allowed() {
+                        info!(tool = %name, verdict = %verdict, "Harness verdict");
                     }
                     verdict
                 }
                 Err(e) => {
                     // Harness evaluation errors are non-fatal — default to ALLOW
-                    eprintln!("[bedrock] Warning: harness on_tool_call error: {}", e);
+                    warn!(error = %e, "Harness on_tool_call error");
                     Verdict::Allow
                 }
             }
@@ -973,18 +945,12 @@ impl Kernel {
                 "total_tokens": input_tokens + output_tokens,
             });
             match engine.evaluate("on_token_usage", payload) {
-                Ok(verdict) => {
                     if verdict.is_rejected() {
-                        eprintln!(
-                            "[bedrock] ⚠ Token usage harness: {}",
-                            verdict.reason().unwrap_or("budget exceeded")
-                        );
+                        warn!(reason = %verdict.reason().unwrap_or("budget exceeded"), "Token usage harness rejection");
                     }
                 }
                 Err(e) => {
-                    if self.verbose {
-                        eprintln!("[bedrock] Warning: harness on_token_usage error: {}", e);
-                    }
+                    warn!(error = %e, "Harness on_token_usage error");
                 }
             }
         }
@@ -996,34 +962,24 @@ impl Kernel {
         if self.json {
             // In JSON mode, all events go to stdout as NDJSON
             println!("{}", serde_json::to_string(event).unwrap_or_default());
-        } else if self.verbose {
-            let event_type = event.event_type();
-            match event {
-                KernelEvent::MessageDelta { .. } => {}
-                _ => {
-                    eprintln!("[bedrock:{}] {:?}", event_type, event);
-                }
-            }
         }
+        debug!(event_type = %event.event_type(), event = ?event, "Event persisted");
 
         if let Some(ref store) = self.state {
             let event_type = event.event_type().to_string();
             let payload = serde_json::to_value(event).unwrap_or(serde_json::json!({}));
             // Fire and forget — don't fail the agent loop if persistence fails
             if let Err(e) = store.insert_event(session_id, &event_type, &payload).await {
-                if self.verbose {
-                    eprintln!("[bedrock] Warning: failed to persist event: {}", e);
-                }
+                warn!(error = %e, "Failed to persist event to store");
             }
         }
     }
 
     /// Connect to an MCP server, initialize it, and register its tools.
+    #[instrument(skip(self, args), fields(command = %command, args = ?args))]
     async fn spawn_mcp_server(&mut self, command: &str, args: &[String]) -> Result<usize> {
         let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        if self.verbose {
-            eprintln!("[bedrock] Connecting to MCP server: {} {:?}", command, args);
-        }
+        info!("Connecting to MCP server");
 
         let transport = StdioTransport::new(command, &args_str)
             .with_context(|| format!("Failed to spawn MCP process: {}", command))?;
@@ -1043,9 +999,7 @@ impl Kernel {
                 .with_context(|| "Failed to register MCP tool")?;
         }
 
-        if self.verbose {
-            eprintln!("[bedrock] Registered {} MCP tools.", count);
-        }
+        info!(count = count, "MCP tools registered");
 
         Ok(count)
     }

@@ -48,8 +48,10 @@ impl Tool for EditFileTool {
         })
     }
 
+    #[tracing::instrument(skip(self, params, ctx), fields(path = %params["path"].as_str().unwrap_or("unknown")))]
     async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: EditFileArgs = parse_args(params)?;
+        tracing::info!(path = %args.path, "Editing file");
         let path = resolve_path(&args.path, &ctx.workspace_root);
 
         validate_workspace_path(&path, &ctx.workspace_root)?;

@@ -49,8 +49,10 @@ impl Tool for SubmitTaskTool {
         })
     }
 
+    #[tracing::instrument(skip(self, params, _ctx), fields(title = %params["title"].as_str().unwrap_or("unknown")))]
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: SubmitTaskArgs = parse_args(params)?;
+        tracing::info!(title = %args.title, subtasks = args.subtasks.len(), "Submitting task plan");
         
         // We just return the details. The Kernel will handle the actual queue manipulation
         // by inspecting the metadata.

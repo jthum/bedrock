@@ -13,6 +13,14 @@ use bedrock::kernel::Kernel;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Log level (error, warn, info, debug, trace)
+    #[arg(long, default_value = "info", global = true)]
+    log_level: String,
+
+    /// Path to log file
+    #[arg(long, global = true)]
+    log_file: Option<PathBuf>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -82,9 +90,40 @@ enum Commands {
     },
 }
 
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+fn init_tracing(log_level: &str, log_file: Option<PathBuf>) -> Result<()> {
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(log_level))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let stdout_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(true);
+
+    let file_layer = log_file.map(|path| {
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let filename = path.file_name().unwrap_or_default();
+        let file_appender = tracing_appender::rolling::never(parent, filename);
+        fmt::layer()
+            .with_writer(file_appender)
+            .with_ansi(false)
+            .json()
+    });
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_tracing(&cli.log_level, cli.log_file)?;
 
     match cli.command {
         Commands::Run {
@@ -109,18 +148,17 @@ async fn main() -> Result<()> {
                 config.validate()?;
             }
 
-            if verbose {
-                eprintln!("[bedrock] Config loaded:");
-                eprintln!("  model: {}", config.agent.model);
-                eprintln!("  provider: {}", config.agent.provider);
-                eprintln!("  workspace: {}", config.kernel.workspace_root);
-                eprintln!("  harness_dir: {}", config.harness.directory);
-                eprintln!("  db: {}", config.persistence.database_path);
-                eprintln!();
-            }
+            tracing::info!(
+                model = %config.agent.model,
+                provider = %config.agent.provider,
+                workspace = %config.kernel.workspace_root,
+                harness_dir = %config.harness.directory,
+                db = %config.persistence.database_path,
+                "Config loaded"
+            );
 
             // Build kernel, initialize state store, and run
-            let mut kernel = Kernel::new(config, verbose, json);
+            let mut kernel = Kernel::new(config, json);
             kernel.init_state().await?;
             kernel.init_clients()?;
             kernel.init_harness().await?;
@@ -149,15 +187,14 @@ async fn main() -> Result<()> {
                 config.validate()?;
             }
 
-            if verbose {
-                eprintln!("[bedrock] Config loaded (REPL mode):");
-                eprintln!("  model: {}", config.agent.model);
-                eprintln!("  provider: {}", config.agent.provider);
-                eprintln!();
-            }
+            tracing::info!(
+                model = %config.agent.model,
+                provider = %config.agent.provider,
+                "Config loaded (REPL mode)"
+            );
 
             // Build kernel
-            let mut kernel = Kernel::new(config, verbose, false); // JSON not supported in REPL yet
+            let mut kernel = Kernel::new(config, false); // JSON not supported in REPL yet
             kernel.init_state().await?;
             kernel.init_clients()?;
             kernel.init_harness().await?;
@@ -165,9 +202,8 @@ async fn main() -> Result<()> {
             
             // Start REPL loop
             let mut rl = DefaultEditor::new()?;
-            if verbose {
-                eprintln!("[bedrock] REPL started. Type 'exit' or Ctrl+D to quit.");
-            } else {
+            tracing::info!("REPL started. Type 'exit' or Ctrl+D to quit.");
+            if !verbose {
                  println!("Bedrock REPL v{}", env!("CARGO_PKG_VERSION"));
                  println!("Type 'exit' or Ctrl+D to quit. Type '/reload' to reload harness.");
             }
@@ -184,10 +220,10 @@ async fn main() -> Result<()> {
                         if line.eq_ignore_ascii_case("exit") { break; }
                         
                         if line.eq_ignore_ascii_case("/reload") {
-                            eprintln!("[bedrock] Reloading harness...");
+                            tracing::info!("Reloading harness...");
                             match kernel.reload_harness().await {
-                                Ok(_) => eprintln!("[bedrock] Harness reloaded successfully."),
-                                Err(e) => eprintln!("[bedrock] Failed to reload harness: {}", e),
+                                Ok(_) => tracing::info!("Harness reloaded successfully."),
+                                Err(e) => tracing::error!(error = %e, "Failed to reload harness"),
                             }
                             continue;
                         }
@@ -229,7 +265,7 @@ async fn main() -> Result<()> {
             }
 
             // Build kernel
-            let mut kernel = Kernel::new(config, true, false);
+            let mut kernel = Kernel::new(config, false);
             kernel.init_state().await?;
             kernel.init_clients()?;
             kernel.init_harness().await?;

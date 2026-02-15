@@ -42,8 +42,10 @@ impl Tool for WriteFileTool {
         })
     }
 
+    #[tracing::instrument(skip(self, params, ctx), fields(path = %params["path"].as_str().unwrap_or("unknown")))]
     async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: WriteFileArgs = parse_args(params)?;
+        tracing::info!(path = %args.path, "Writing file");
         let path = resolve_path(&args.path, &ctx.workspace_root);
 
         // Security: validate path is within workspace

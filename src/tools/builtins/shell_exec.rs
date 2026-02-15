@@ -56,8 +56,10 @@ impl Tool for ShellExecTool {
         })
     }
 
+    #[tracing::instrument(skip(self, params, ctx), fields(command = %params["command"].as_str().unwrap_or("unknown")))]
     async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: ShellExecArgs = parse_args(params)?;
+        tracing::info!(command = %args.command, "Executing shell command");
 
         // Resolve working directory
         let cwd = if let Some(ref dir) = args.cwd {
