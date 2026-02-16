@@ -158,13 +158,14 @@ async fn main() -> Result<()> {
             );
 
             // Build kernel, initialize state store, and run
-            let mut kernel = Kernel::new(config, json);
+            let mut kernel = Kernel::builder(config).json_mode(json).build()?;
             kernel.init_state().await?;
             kernel.init_clients()?;
             kernel.init_harness().await?;
             kernel.start_watcher()?;
-            kernel.run(Some(prompt)).await?;
-            kernel.end_session().await?;
+            let mut session = kernel.create_session();
+            kernel.run(&mut session, Some(prompt)).await?;
+            kernel.end_session(&mut session).await?;
 
             Ok(())
         }
@@ -194,7 +195,7 @@ async fn main() -> Result<()> {
             );
 
             // Build kernel
-            let mut kernel = Kernel::new(config, false); // JSON not supported in REPL yet
+            let mut kernel = Kernel::builder(config).build()?; // JSON not supported in REPL yet
             kernel.init_state().await?;
             kernel.init_clients()?;
             kernel.init_harness().await?;
@@ -209,7 +210,8 @@ async fn main() -> Result<()> {
             }
 
             // Trigger AgentStart
-            kernel.run(None).await?;
+            let mut session = kernel.create_session();
+            kernel.run(&mut session, None).await?;
 
             loop {
                 let readline = rl.readline(">> ");
@@ -230,7 +232,7 @@ async fn main() -> Result<()> {
                         let _ = rl.add_history_entry(line);
                         
                         // Push prompt to kernel queue and run until empty
-                        kernel.run(Some(line.to_string())).await?;
+                        kernel.run(&mut session, Some(line.to_string())).await?;
                     },
                     Err(ReadlineError::Interrupted) => {
                         println!("^C");
@@ -246,7 +248,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            kernel.end_session().await?;
+            kernel.end_session(&mut session).await?;
             Ok(())
         }
         Commands::Script { path, config, model, provider } => {

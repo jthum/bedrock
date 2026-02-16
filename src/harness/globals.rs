@@ -15,6 +15,10 @@ use crate::inference::provider::{
 };
 use crate::inference::embeddings::EmbeddingProvider;
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Weak};
+
+pub type SessionQueue = Arc<Mutex<VecDeque<String>>>;
+pub type ActiveSessionQueue = Arc<Mutex<Option<SessionQueue>>>;
 
 /// Shared state passed to async Lua callbacks via app data.
 pub struct HarnessAppData {
@@ -23,8 +27,8 @@ pub struct HarnessAppData {
     pub state_store: Option<StateStore>,
     pub clients: HashMap<String, ProviderClient>,
     pub embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
-    pub queue: Arc<Mutex<VecDeque<String>>>,
-    pub config: Arc<crate::kernel::config::BedrockConfig>,
+    pub queue: ActiveSessionQueue,
+    pub config: Arc<crate::kernel::config::BedrockConfig>, // Full type path to avoid cycle if needed
 }
 
 /// Register all Bedrock-SL globals into the Lua VM.
@@ -339,13 +343,18 @@ fn register_session_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()
 
     // session.queue(command) -> void
     {
-        let queue = app_data.queue.clone();
+        let active_queue = app_data.queue.clone();
         session_table.set("queue", lua.create_function(move |_lua, command: String| {
-            let queue = queue.clone();
+            let active_queue = active_queue.clone();
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    let mut q = queue.lock().await;
-                    q.push_back(command);
+                    let queue_opt = active_queue.lock().await;
+                    if let Some(queue) = &*queue_opt {
+                        let mut q = queue.lock().await;
+                        q.push_back(command);
+                    } else {
+                        eprintln!("[harness] WARN: session.queue called without active session");
+                    }
                 })
             });
             Ok(())
@@ -354,15 +363,18 @@ fn register_session_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()
     
     // session.queue_all(commands) -> void
     {
-        let queue = app_data.queue.clone();
+        let active_queue = app_data.queue.clone();
         session_table.set("queue_all", lua.create_function(move |_lua, commands: Vec<String>| {
-            let queue = queue.clone();
+            let active_queue = active_queue.clone();
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    let mut q = queue.lock().await;
-                    for cmd in commands {
-                         q.push_back(cmd);
-                    }
+                    let queue_opt = active_queue.lock().await;
+                     if let Some(queue) = &*queue_opt {
+                        let mut q = queue.lock().await;
+                        for cmd in commands {
+                             q.push_back(cmd);
+                        }
+                     }
                 })
             });
             Ok(())
@@ -371,13 +383,16 @@ fn register_session_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()
 
     // session.queue_next(command) -> void
     {
-        let queue = app_data.queue.clone();
+        let active_queue = app_data.queue.clone();
         session_table.set("queue_next", lua.create_function(move |_lua, command: String| {
-            let queue = queue.clone();
+            let active_queue = active_queue.clone();
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                     let mut q = queue.lock().await;
-                     q.push_front(command);
+                     let queue_opt = active_queue.lock().await;
+                     if let Some(queue) = &*queue_opt {
+                         let mut q = queue.lock().await;
+                         q.push_front(command);
+                     }
                 })
             });
             Ok(())
@@ -706,7 +721,7 @@ mod tests {
             state_store: None,
             clients: HashMap::new(),
             embedding_provider: None,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            queue: Arc::new(Mutex::new(Some(Arc::new(Mutex::new(VecDeque::new()))))),
             config: Arc::new(crate::kernel::config::BedrockConfig {
                 agent: crate::kernel::config::AgentConfig {
                     system_prompt: "test".to_string(),
