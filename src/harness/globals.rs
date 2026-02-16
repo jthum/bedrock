@@ -5,7 +5,6 @@
 
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Value, Table};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::sync::Mutex;
 use glob::glob;
 
@@ -15,7 +14,7 @@ use crate::inference::provider::{
 };
 use crate::inference::embeddings::EmbeddingProvider;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 pub type SessionQueue = Arc<Mutex<VecDeque<String>>>;
 pub type ActiveSessionQueue = Arc<Mutex<Option<SessionQueue>>>;
@@ -652,7 +651,7 @@ fn register_agent_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()> 
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     // Create sub-kernel
-                    let mut kernel = crate::kernel::Kernel::new(config, false); // Not json mode for subtask
+                    let mut kernel = crate::kernel::Kernel::builder(config).json_mode(false).build().map_err(|e| e.to_string())?;
                     
                     // Inject shared components
                     kernel.clients = clients;
@@ -665,14 +664,17 @@ fn register_agent_module(lua: &Lua, app_data: &HarnessAppData) -> LuaResult<()> 
                         return Err(format!("Sub-kernel harness init failed: {}", e));
                     }
                     
+                    // Create session for sub-kernel
+                    let mut session = kernel.create_session();
+
                     // Run
-                    if let Err(e) = kernel.run(Some(prompt)).await {
+                    if let Err(e) = kernel.run(&mut session, Some(prompt)).await {
                         return Err(format!("Sub-kernel run failed: {}", e));
                     }
                     
                     // Extract result
                     // Get last message from assistant
-                    if let Some(last) = kernel.history.last() {
+                    if let Some(last) = session.history.last() {
                          if last.role == crate::inference::provider::InferenceRole::Assistant {
                              // Join text content
                              let text = last.content.iter().filter_map(|c| match c {
@@ -824,7 +826,7 @@ mod tests {
             state_store: None,
             clients: HashMap::new(),
             embedding_provider: None,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            queue: Arc::new(Mutex::new(Some(Arc::new(Mutex::new(VecDeque::new()))))),
             config: Arc::new(crate::kernel::config::BedrockConfig {
                 agent: crate::kernel::config::AgentConfig {
                     system_prompt: "test".to_string(),
@@ -861,7 +863,7 @@ mod tests {
             state_store: None,
             clients: HashMap::new(),
             embedding_provider: None,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            queue: Arc::new(Mutex::new(Some(Arc::new(Mutex::new(VecDeque::new()))))),
             config: Arc::new(crate::kernel::config::BedrockConfig {
                 agent: crate::kernel::config::AgentConfig {
                     system_prompt: "test".to_string(),
@@ -891,7 +893,7 @@ mod tests {
             state_store: None,
             clients: HashMap::new(),
             embedding_provider: None,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            queue: Arc::new(Mutex::new(Some(Arc::new(Mutex::new(VecDeque::new()))))),
             config: Arc::new(crate::kernel::config::BedrockConfig {
                 agent: crate::kernel::config::AgentConfig {
                     system_prompt: "test".to_string(),

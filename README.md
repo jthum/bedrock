@@ -359,7 +359,7 @@ type = "openai"  # or "no_op" for environments without embedding support
 
 ## Project Status
 
-Bedrock is at **v0.8.5**. The core runtime is functional and tested. What's implemented:
+Bedrock is at **v0.9.0**. The core runtime is functional and tested. What's implemented:
 
 - Multi-provider inference (Anthropic, OpenAI) with streaming
 - Full tool execution loop (read, write, edit, shell, submit_task, bridge_mcp)

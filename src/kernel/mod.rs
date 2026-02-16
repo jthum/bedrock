@@ -14,10 +14,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
 use tracing::{info, warn, error, debug, instrument};
 use futures::future::join_all;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use crate::harness::engine::HarnessEngine;
 use crate::harness::globals::HarnessAppData;
@@ -28,7 +27,6 @@ use crate::inference::provider::{
 };
 use crate::persistence::state::StateStore;
 use crate::tools::ToolContext;
-use crate::tools::builtins::create_default_registry;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::mcp::McpToolProxy;
 use mcp_sdk::client::McpClient;
@@ -54,7 +52,7 @@ pub struct Kernel {
     pub(crate) embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Active session queue for harness interaction
     pub(crate) active_queue: crate::harness::globals::ActiveSessionQueue,
-    pub(crate) mcp_clients: Vec<Arc<McpClient>>,
+    pub(crate) mcp_clients: Vec<Arc<McpClient<mcp_sdk::transport::StdioTransport>>>,
 }
 
 /// A pending tool call collected during streaming.
@@ -95,7 +93,7 @@ impl Kernel {
         let mut session = SessionState::new();
         // Spawn background persistence if state is available
         if let Some(ref store) = self.state {
-             let mut rx_opt = session.event_rx.take(); // take the rx from session
+             let rx_opt = session.event_rx.take(); // take the rx from session
              if let Some(rx_mutex) = rx_opt {
                  // extract rx from mutex? It's Arc<Mutex<Option<Rx>>>.
                  // We need to spawn a task that locks it once or takes it.
@@ -160,12 +158,16 @@ impl Kernel {
                         .find(|p| p.kind == "openai")
                         .with_context(|| "OpenAI embeddings selected but no OpenAI provider configured")?;
                         
+                     let api_key_env = openai_config.api_key_env.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("OpenAI provider missing 'api_key_env' configuration"))?;
+                     let api_key = std::env::var(api_key_env)
+                        .with_context(|| format!("Environment variable '{}' not set", api_key_env))?;
+                     
                      crate::inference::embeddings::create_embedding_provider(&crate::inference::embeddings::EmbeddingConfig::OpenAI {
-                        api_key: openai_config.api_key_env.as_ref().map(|k| std::env::var(k).context(format!("Environment variable '{}' not set", k)).unwrap()).unwrap(),
+                        api_key,
                         model: "text-embedding-3-small".to_string(),
                     })
-                },
-                crate::kernel::config::EmbeddingConfig::NoOp => {
+                },                crate::kernel::config::EmbeddingConfig::NoOp => {
                     crate::inference::embeddings::create_embedding_provider(&crate::inference::embeddings::EmbeddingConfig::NoOp)
                 }
             }
@@ -201,8 +203,6 @@ impl Kernel {
         Ok(())
     }
 
-        Ok(())
-    }
 
     /// Initialize the harness engine. Call after `init_state()` and before `run()`.
     #[instrument(skip(self), fields(directory = %self.config.harness.directory))]
@@ -264,7 +264,6 @@ impl Kernel {
         clients: HashMap<String, ProviderClient>,
         state: Option<StateStore>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
-        embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
         active_queue: crate::harness::globals::ActiveSessionQueue,
     ) -> Result<()> {
         let harness_dir = PathBuf::from(&config.harness.directory);
@@ -279,7 +278,6 @@ impl Kernel {
             workspace_root: PathBuf::from(&config.kernel.workspace_root),
             state_store: state.clone(),
             clients,
-            embedding_provider,
             embedding_provider,
             queue: active_queue,
             config: Arc::new(config),
@@ -407,7 +405,7 @@ impl Kernel {
             {
                 let harness = self.harness.lock().await;
                 if let Some(ref engine) = *harness {
-                    if let Err(e) = engine.on_agent_start(&session_id) {
+                    if let Err(e) = engine.evaluate("on_agent_start", serde_json::json!({ "session_id": session_id })) {
                          warn!(error = %e, "Harness on_agent_start failed");
                     }
                 }

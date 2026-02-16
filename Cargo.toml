@@ -1,6 +1,6 @@
 [package]
 name = "bedrock"
-version = "0.8.5"
+version = "0.9.0"
 edition = "2021"
 description = "A single-binary, event-driven LLM execution runtime with composable Lua harness scripts"
 

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use std::path::PathBuf;
 
 use bedrock::kernel::config::BedrockConfig;
 use bedrock::kernel::Kernel;
@@ -51,7 +51,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    
+
     /// Start an interactive REPL session
     Repl {
         /// Path to bedrock.toml config file
@@ -97,9 +97,7 @@ fn init_tracing(log_level: &str, log_file: Option<PathBuf>) -> Result<()> {
         .or_else(|_| EnvFilter::try_new(log_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let stdout_layer = fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_ansi(true);
+    let stdout_layer = fmt::layer().with_writer(std::io::stderr).with_ansi(true);
 
     let file_layer = log_file.map(|path| {
         let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -135,8 +133,8 @@ async fn main() -> Result<()> {
             json,
         } => {
             // Load config
-            let mut config = BedrockConfig::from_file(&config)
-                .with_context(|| "Failed to load config")?;
+            let mut config =
+                BedrockConfig::from_file(&config).with_context(|| "Failed to load config")?;
 
             // Apply CLI overrides
             if let Some(m) = model {
@@ -176,8 +174,8 @@ async fn main() -> Result<()> {
             verbose,
         } => {
             // Load config
-            let mut config = BedrockConfig::from_file(&config)
-                .with_context(|| "Failed to load config")?;
+            let mut config =
+                BedrockConfig::from_file(&config).with_context(|| "Failed to load config")?;
 
             // Apply CLI overrides
             if let Some(m) = model {
@@ -200,13 +198,13 @@ async fn main() -> Result<()> {
             kernel.init_clients()?;
             kernel.init_harness().await?;
             kernel.start_watcher()?;
-            
+
             // Start REPL loop
             let mut rl = DefaultEditor::new()?;
             tracing::info!("REPL started. Type 'exit' or Ctrl+D to quit.");
             if !verbose {
-                 println!("Bedrock REPL v{}", env!("CARGO_PKG_VERSION"));
-                 println!("Type 'exit' or Ctrl+D to quit. Type '/reload' to reload harness.");
+                println!("Bedrock REPL v{}", env!("CARGO_PKG_VERSION"));
+                println!("Type 'exit' or Ctrl+D to quit. Type '/reload' to reload harness.");
             }
 
             // Trigger AgentStart
@@ -218,9 +216,13 @@ async fn main() -> Result<()> {
                 match readline {
                     Ok(line) => {
                         let line = line.trim();
-                        if line.is_empty() { continue; }
-                        if line.eq_ignore_ascii_case("exit") { break; }
-                        
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if line.eq_ignore_ascii_case("exit") {
+                            break;
+                        }
+
                         if line.eq_ignore_ascii_case("/reload") {
                             tracing::info!("Reloading harness...");
                             match kernel.reload_harness().await {
@@ -230,18 +232,18 @@ async fn main() -> Result<()> {
                             continue;
                         }
                         let _ = rl.add_history_entry(line);
-                        
+
                         // Push prompt to kernel queue and run until empty
                         kernel.run(&mut session, Some(line.to_string())).await?;
-                    },
+                    }
                     Err(ReadlineError::Interrupted) => {
                         println!("^C");
                         break;
-                    },
+                    }
                     Err(ReadlineError::Eof) => {
-                         println!("^D");
+                        println!("^D");
                         break;
-                    },
+                    }
                     Err(err) => {
                         println!("Error: {:?}", err);
                         break;
@@ -251,10 +253,15 @@ async fn main() -> Result<()> {
             kernel.end_session(&mut session).await?;
             Ok(())
         }
-        Commands::Script { path, config, model, provider } => {
-             // Load config
-            let mut config = BedrockConfig::from_file(&config)
-                .with_context(|| "Failed to load config")?;
+        Commands::Script {
+            path,
+            config,
+            model,
+            provider,
+        } => {
+            // Load config
+            let mut config =
+                BedrockConfig::from_file(&config).with_context(|| "Failed to load config")?;
 
             // Apply CLI overrides
             if let Some(m) = model {
@@ -266,7 +273,7 @@ async fn main() -> Result<()> {
             }
 
             // Build kernel
-            let mut kernel = Kernel::new(config, false);
+            let mut kernel = Kernel::builder(config).json_mode(false).build()?;
             kernel.init_state().await?;
             kernel.init_clients()?;
             kernel.init_harness().await?;
@@ -276,7 +283,7 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("Failed to read script: {}", path.display()))?;
 
             kernel.run_script(&script_content).await?;
-            
+
             Ok(())
         }
     }

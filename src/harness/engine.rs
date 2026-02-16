@@ -323,7 +323,7 @@ mod tests {
             state_store: None,
             clients: std::collections::HashMap::new(),
             embedding_provider: None,
-            queue: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
+            queue: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()))))),
             config: std::sync::Arc::new(crate::kernel::config::BedrockConfig::default()),
         }
     }

@@ -1,15 +1,13 @@
-use anyhow::{Context, Result};
-use std::collections::{HashMap, VecDeque};
+use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex;
 
 use crate::kernel::{Kernel, BedrockConfig};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::builtins::create_default_registry;
 use crate::persistence::state::StateStore;
 use crate::inference::embeddings::EmbeddingProvider;
-use crate::inference::provider::ProviderClient;
 
 /// Builder for constructing a `Kernel` instance.
 pub struct RuntimeBuilder {
