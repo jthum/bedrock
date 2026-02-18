@@ -1,3 +1,5 @@
+> This repository has been renamed and is now available at https://github.com/jthum/turin.
+
 # Bedrock
 
 **A single-binary runtime for building AI agents you can actually control.**
